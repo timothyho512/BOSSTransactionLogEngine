@@ -13,6 +13,9 @@ using boss::Symbol;
 
 using boss::Expression;
 
+using boss::expressions::generic::get;
+using boss::expressions::generic::get_if;
+
 // WAL - just a list of expression for now
 static std:: vector<Expression> writeAheadLog;
 
@@ -47,6 +50,26 @@ static Expression evaluate(Expression &&e) {
         if (head == "ClearWAL"_) {
           writeAheadLog.clear();
           return "WAL_Cleared"_();
+        }
+        if (head == "DetectConflicts"_) {
+          boss::ExpressionArguments conflicts;
+          for (size_t i = 0; i < writeAheadLog.size(); i++) {
+            for (size_t j = i + 1; j < writeAheadLog.size(); j++) {
+              auto const& entryI = get<ComplexExpression>(writeAheadLog[i]);
+              auto const& entryJ = get<ComplexExpression>(writeAheadLog[j]);
+              if (entryI.getArguments().size() == 0 || entryJ.getArguments().size() == 0) continue;
+              auto argI = entryI.getArguments()[0];
+              auto argJ = entryJ.getArguments()[0];
+              auto const* tableI = get_if<Symbol>(&argI);
+              auto const* tableJ = get_if<Symbol>(&argJ);
+              if (tableI && tableJ && tableI->getName() == tableJ->getName()) {
+                conflicts.push_back(
+                  "Conflict"_(entryI.getHead(), entryJ.getHead(), *tableI)
+                );
+              }
+            }
+          }
+          return ComplexExpression("List"_, {}, std::move(conflicts), {});
         }
       }
       return std::move(expr);
