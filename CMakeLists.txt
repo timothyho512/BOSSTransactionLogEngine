@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 4.2)
-project(BOSSTransactionEngine)
+project(BOSSTransactionLogEngine)
 
 ############################## Custom build modes ###############################
 
@@ -37,7 +37,7 @@ ExternalProject_Add(BOSS
   GIT_REPOSITORY ${BOSS_SOURCE_REPOSITORY}
   DOWNLOAD_DIR /Users/timothyho/.cmake-downloads/${CMAKE_PROJECT_NAME}
   GIT_TAG ${BOSS_SOURCE_BRANCH}
-  CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${BOSSTransactionEngine_BINARY_DIR}/deps $<IF:$<CONFIG:>,,-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}> -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}  -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER} -DCMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}
+  CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${BOSSTransactionLogEngine_BINARY_DIR}/deps $<IF:$<CONFIG:>,,-DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}> -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}  -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER} -DCMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS}
   )
 
 
@@ -49,15 +49,15 @@ if(MSVC)
 else()
   set(LibraryType MODULE)
 endif(MSVC)
-add_library(BOSSTransactionEngine ${LibraryType} Source/BOSSTransactionEngine.cpp)
+add_library(BOSSTransactionLogEngine ${LibraryType} Source/BOSSTransactionLogEngine.cpp)
 
-set_property(TARGET BOSSTransactionEngine PROPERTY CXX_STANDARD 23)
+set_property(TARGET BOSSTransactionLogEngine PROPERTY CXX_STANDARD 23)
 if(MSVC)
-  target_compile_options(BOSSTransactionEngine PUBLIC "/Zc:__cplusplus")
-  target_compile_options(BOSSTransactionEngine PUBLIC "/EHsc")
+  target_compile_options(BOSSTransactionLogEngine PUBLIC "/Zc:__cplusplus")
+  target_compile_options(BOSSTransactionLogEngine PUBLIC "/EHsc")
 endif(MSVC)
-target_include_directories(BOSSTransactionEngine SYSTEM PUBLIC ${BOSSTransactionEngine_BINARY_DIR}/deps/include)
-add_dependencies(BOSSTransactionEngine BOSS)
+target_include_directories(BOSSTransactionLogEngine SYSTEM PUBLIC ${BOSSTransactionLogEngine_BINARY_DIR}/deps/include)
+add_dependencies(BOSSTransactionLogEngine BOSS)
 
-set_target_properties(BOSSTransactionEngine PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
-install(TARGETS BOSSTransactionEngine LIBRARY DESTINATION lib)
+set_target_properties(BOSSTransactionLogEngine PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
+install(TARGETS BOSSTransactionLogEngine LIBRARY DESTINATION lib)
