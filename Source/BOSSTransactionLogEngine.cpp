@@ -27,15 +27,18 @@ static std::string getTableName(ComplexExpression const& entry) {
   return table ? table->getName() : "";
 }
 
-// Helper: extract row IDs from a WAL entry (second argument is ID(List(...)))
+// Helper: extract row IDs from a WAL entry (second argument is "id"_(List(...)))
 static std::vector<int32_t> getRowIDs(ComplexExpression const& entry) {
   std::vector<int32_t> ids;
   if(entry.getArguments().size() < 2) return ids;
   auto idArg = entry.getArguments()[1];
   auto const* idExpr = get_if<ComplexExpression>(&idArg);
   if(!idExpr) return ids;
-  auto listArg = idExpr->getArguments()[0];   // List(5, 9)
-  auto const* listExpr = get_if<ComplexExpression>(&listArg);  // List(...)
+  // might need to change later as this is hardcoded, (primary key column might no always be ids)
+  if(idExpr->getHead().getName() != "id") return ids;
+
+  auto listArg = idExpr->getArguments()[0];
+  auto const* listExpr = get_if<ComplexExpression>(&listArg);
   if(!listExpr) return ids;
   for(size_t i = 0; i < listExpr->getArguments().size(); i++) {
     auto val = listExpr->getArguments()[i];
@@ -45,20 +48,16 @@ static std::vector<int32_t> getRowIDs(ComplexExpression const& entry) {
   return ids;
 }
 
-// Note: if entries have multiple row IDs, any overlap causes the entire
-// earlier entry to be treated as redundant. Row-level splitting of
-// partially overlapping multi-row updates is left as future work.
-// Helper: check if two entries share any row IDs on the same table
+// Initial design decision is for the prototype
+// we only allow one row, or one ID per expression
+// to prevent optimisation complexity
+// need to fix the code below
 static bool sameTableAndRow(ComplexExpression const& a, ComplexExpression const& b) {
   if(getTableName(a) != getTableName(b)) return false;
   auto idsA = getRowIDs(a);
   auto idsB = getRowIDs(b);
-  for(auto idA : idsA) {
-    for(auto idB : idsB) {
-      if(idA == idB) return true;
-    }
-  }
-  return false;
+  if(idsA.empty() || idsB.empty()) return false;
+  return idsA[0] == idsB[0];
 }
 
 // OptimiseWAL - apply three optimisation rules:
@@ -85,16 +84,26 @@ static void optimiseWAL() {
 
       // Rule 1: later Update on same row and same column wins
       if (entryI.getHead() == "Update"_ && entryJ.getHead() == "Update"_) {
+        // get "Set"_ from entryI - arg index 2
+        auto setArgI = entryI.getArguments()[2];
+        auto const* setExprI = get_if<ComplexExpression>(&setArgI);
+        if(!setExprI) continue;
+
+        // get "Set"_ from entryJ - arg index 2  
+        auto setArgJ = entryJ.getArguments()[2];
+        auto const* setExprJ = get_if<ComplexExpression>(&setArgJ);
+        if(!setExprJ) continue;
+
         // check if they share any column
-        for (size_t ci = 2; ci < entryI.getArguments().size(); ci++) {
-          auto colI = entryI.getArguments()[ci];
-          auto const* colIExpr = get_if<ComplexExpression>(&colI);
-          if(!colIExpr) continue;
-          for (size_t cj = 2; cj < entryJ.getArguments().size(); cj++) {
-            auto colJ = entryJ.getArguments()[cj];
-            auto const* colJExpr = get_if<ComplexExpression>(&colJ);
-            if(!colJExpr) continue;
-            if(colIExpr->getHead() == colJExpr->getHead()) {
+        for (size_t ci = 0; ci < setExprI->getArguments().size(); ci++) {
+          auto colIArg = setExprI->getArguments()[ci];
+          auto const* colI = get_if<ComplexExpression>(&colIArg);
+          if(!colI) continue;
+          for (size_t cj = 0; cj < setExprJ->getArguments().size(); cj++) {
+            auto colJArg = setExprJ->getArguments()[cj];
+            auto const* colJ = get_if<ComplexExpression>(&colJArg);
+            if(!colJ) continue;
+            if(colI->getHead() == colJ->getHead()) {
               redundant = true;
               break;
             }
@@ -121,12 +130,15 @@ static void optimiseWAL() {
       continue;
     }
 
-    // collect all columns from this and subsequent Updates on same row
-    boss::ExpressionArguments mergedArgs;
+
     // clone each argument to avoid ArgumentWrapper temporary issue
-    for (size_t ci = 0; ci < entryI.getArguments().size(); ci++) {
-      mergedArgs.push_back(entryI.cloneArgument(ci));
+    auto setArgI = entryI.getArguments()[2];
+    auto const* setExprI = get_if<ComplexExpression>(&setArgI);
+    boss::ExpressionArguments mergedSetArgs;
+    for(size_t ci = 0; ci < setExprI->getArguments().size(); ci++) {
+      mergedSetArgs.push_back(setExprI->cloneArgument(ci));
     }
+  
     // mergedArgs.push_back(entryI.getArguments()[0]); // table
     // mergedArgs.push_back(entryI.getArguments()[1]); // ID
     // for(size_t ci = 2; ci < entryI.getArguments().size(); ci++) {
@@ -140,15 +152,20 @@ static void optimiseWAL() {
       if(!sameTableAndRow(entryI, entryJ)) continue;
 
       // merge columns from entryJ
-      for(size_t cj = 2; cj < entryJ.getArguments().size(); cj++) {
-        mergedArgs.push_back(entryJ.cloneArgument(cj));
+      auto setArgJ = entryJ.getArguments()[2];
+      auto const* setExprJ = get_if<ComplexExpression>(&setArgJ);
+      for(size_t cj = 0; cj < setExprJ->getArguments().size(); cj++) {
+        mergedSetArgs.push_back(setExprJ->cloneArgument(cj));
       }
       mergedFlag[j] = true;
     }
-
+    // build merged WAL entry
+    boss::ExpressionArguments mergedArgs;
+    mergedArgs.push_back(entryI.cloneArgument(0)); // table name
+    mergedArgs.push_back(entryI.cloneArgument(1)); // id
+    mergedArgs.push_back(ComplexExpression("Set"_, {}, std::move(mergedSetArgs), {}));
     merged.push_back(ComplexExpression("Update"_, {}, std::move(mergedArgs), {}));
   }
-
   writeAheadLog = std::move(merged);
 }
 
@@ -168,15 +185,106 @@ static Expression evaluate(Expression &&e) {
 
         // Update - defer to WAL
         if (head == "Update"_) {
-          std::cout << "WAL: captured Update" << std::endl;
-          writeAheadLog.push_back(expr.clone());
+          // arg 0 = table name symbol
+          // arg 1 = "Table"_(columns...)
+          // arg 2 = "Set"_(column assignments)
+          // Extract table name - arg 0
+          auto tableArg = expr.getArguments()[0];
+          auto const* tableSymbol = get_if<Symbol>(&tableArg);
+          if(!tableSymbol) return std::move(expr);
+
+          // Extract "Table"_ expression
+          auto tableExprArg = expr.getArguments()[1];
+          auto const* tableExpr = get_if<ComplexExpression>(&tableExprArg);
+          if(!tableExpr) return std::move(expr);
+
+          // find the "id"_ column inside Table
+          ComplexExpression const* idListExpr = nullptr;
+          for (size_t i = 0; i < tableExpr->getArguments().size(); i++) {
+            auto colArg = tableExpr->getArguments()[i];
+            auto const* colExpr = get_if<ComplexExpression>(&colArg);
+            if(!colExpr) continue;
+            if (colExpr->getHead().getName() == "id") {
+              //get the "List"_ inside "id"_
+              auto listArg = colExpr->getArguments()[0];
+              idListExpr = get_if<ComplexExpression>(&listArg);
+              break;
+            }
+          }
+          if(!idListExpr) return std::move(expr);
+
+          // Extract the "Set"_ expression
+          auto setArg = expr.getArguments()[2];
+          auto const* setExpr = get_if<ComplexExpression>(&setArg);
+          if(!setExpr) return std::move(expr);
+
+          // Loop over each id and push one WAL entry per row
+          for (size_t i = 0; i < idListExpr->getArguments().size(); i++) {
+            auto idVal = idListExpr->getArguments()[i];
+            auto const* id = get_if<int32_t>(&idVal);
+            if(!id) continue;
+
+            // build: "Update"_("Customer"_, "id"_("List"_(5)), "Set"_(...))
+            boss::ExpressionArguments walArgs;
+            walArgs.push_back(*tableSymbol);
+            // TODO: hardcoded "id" column name - should use first column of Table instead
+            walArgs.push_back("id"_("List"_(*id)));
+            walArgs.push_back(setExpr->clone());
+            writeAheadLog.push_back(
+              ComplexExpression("Update"_, {}, std::move(walArgs), {})
+            );
+          }
+
+          std::cout << "WAL: captured Update, " 
+                    << idListExpr->getArguments().size() 
+                    << " row(s)" << std::endl;
           return "Update_Logged"_();
         }
 
         // Delete - defer to WAL
         if (head == "Delete"_) {
-          std::cout << "WAL: captured Delete" << std::endl;
-          writeAheadLog.push_back(expr.clone());
+          // arg 0 = table name symbol
+          // arg 1 = "Table"_(columns...)
+
+          auto tableArg = expr.getArguments()[0];
+          auto const* tableSymbol = get_if<Symbol>(&tableArg);
+          if(!tableSymbol) return std::move(expr);
+
+          auto tableExprArg = expr.getArguments()[1];
+          auto const* tableExpr = get_if<ComplexExpression>(&tableExprArg);
+          if(!tableExpr) return std::move(expr);
+
+          // find "id"_ column inside "Table"_
+          ComplexExpression const* idListExpr = nullptr;
+          for (size_t i = 0; i < tableExpr->getArguments().size(); i++) {
+            auto colArg = tableExpr->getArguments()[i];
+            auto const* colExpr = get_if<ComplexExpression>(&colArg);
+            if(!colExpr) continue;
+            if(colExpr->getHead().getName() == "id") {
+              auto listArg = colExpr->getArguments()[0];
+              idListExpr = get_if<ComplexExpression>(&listArg);
+              break;
+            }
+          }
+          if(!idListExpr) return std::move(expr);
+
+          // loop over each id and push one WAL entry per row
+          for(size_t i = 0; i < idListExpr->getArguments().size(); i++) {
+            auto idVal = idListExpr->getArguments()[i];
+            auto const* id = get_if<int32_t>(&idVal);
+            if(!id) continue;
+
+            // build: "Delete"_("Customer"_, "id"_("List"_(5)))
+            boss::ExpressionArguments walArgs;
+            walArgs.push_back(*tableSymbol);
+            walArgs.push_back("id"_("List"_(*id)));
+            writeAheadLog.push_back(
+              ComplexExpression("Delete"_, {}, std::move(walArgs), {})
+            );
+          }
+          std::cout << "WAL: captured Delete, "
+                    << idListExpr->getArguments().size()
+                    << " row(s)" << std::endl;
           return "Delete_Logged"_();
         }
 
