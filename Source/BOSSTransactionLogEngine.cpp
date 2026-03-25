@@ -28,20 +28,44 @@ static std::string getTableName(ComplexExpression const& entry) {
 }
 
 // Helper: extract row IDs from a WAL entry (second argument is "id"_(List(...)))
-static std::vector<int32_t> getRowIDs(ComplexExpression const& entry) {
-  std::vector<int32_t> ids;
+using RowID = std::variant<int32_t, int64_t>;
+static std::vector<RowID> getRowIDs(ComplexExpression const& entry) {
+  std::vector<RowID> ids;
   if(entry.getArguments().size() < 2) return ids;
+  
+  // arg 1 is id(List(...))
   auto idArg = entry.getArguments()[1];
   auto const* idExpr = get_if<ComplexExpression>(&idArg);
   if(!idExpr) return ids;
 
+  // inside id(...) is List(...)
   auto listArg = idExpr->getArguments()[0];
   auto const* listExpr = get_if<ComplexExpression>(&listArg);
   if(!listExpr) return ids;
+
+  // Case 1: plain integers in dynamic arguments
   for(size_t i = 0; i < listExpr->getArguments().size(); i++) {
     auto val = listExpr->getArguments()[i];
-    auto const* id = get_if<int32_t>(&val);
-    if(id) ids.push_back(*id);
+    if(auto const* id32 = get_if<int32_t>(&val)) {
+      ids.push_back(*id32);
+    } else if(auto const* id64 = get_if<int64_t>(&val)) {
+      ids.push_back(*id64);
+    }
+  }
+
+  // Case 2: Spans in span arguments
+  // expression arrives from Velox - type unknown at compile time
+  for (auto const& spanArg : listExpr->getSpanArguments()) {
+    std::visit([&ids](auto const& typedSpan) {
+      using T = std::decay_t<decltype(*typedSpan.begin())>;
+      if constexpr(std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
+        for(auto it = typedSpan.begin(); it != typedSpan.end(); ++it) {
+          ids.push_back(*it);
+        }
+      }
+      // non-numeric types (float, string etc) are silently skipped
+      // because row IDs will always be integers
+    }, spanArg);
   }
   return ids;
 }
@@ -55,7 +79,40 @@ static bool sameTableAndRow(ComplexExpression const& a, ComplexExpression const&
   auto idsA = getRowIDs(a);
   auto idsB = getRowIDs(b);
   if(idsA.empty() || idsB.empty()) return false;
-  return idsA[0] == idsB[0];
+
+  // cast both to int64_t as this does not change the value
+  auto toInt64 = [](RowID const& id) {
+    return std::visit([](auto const& v) { return static_cast<int64_t>(v); }, id); 
+  };
+  return toInt64(idsA[0]) == toInt64(idsB[0]);
+}
+
+// Helper: iterate over all row IDs in a List expression
+// handles both plain integers (our WAL format) and Spans (from Velox)
+// calls callback(idValue) for each ID found, preserving original type
+template<typename Callback>
+static void visitRowIDs(ComplexExpression const& idListExpr, Callback callback) {
+  // case 1: plain integers
+  for(size_t i = 0; i < idListExpr.getArguments().size(); i++) {
+    auto idVal = idListExpr.getArguments()[i];
+    if(auto const* id32 = get_if<int32_t>(&idVal)) {
+      callback(*id32);
+    } else if(auto const* id64 = get_if<int64_t>(&idVal)) {
+      callback(*id64);
+    }
+  }
+
+  // case 2: Spans from Velox
+  for (auto const& spanArg : idListExpr.getSpanArguments()) {
+    std::visit([&](auto const& typedSpan) {
+      using T = std::decay_t<decltype(*typedSpan.begin())>;
+      if constexpr(std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
+        for (auto it = typedSpan.begin(); it != typedSpan.end(); ++it) {
+          callback(*it);
+        }
+      }
+    }, spanArg);
+  }
 }
 
 // OptimiseWAL - apply three optimisation rules:
@@ -213,18 +270,11 @@ static Expression evaluate(Expression &&e) {
           auto const* setExpr = get_if<ComplexExpression>(&setArg);
           if(!setExpr) return std::move(expr);
 
-          // Loop over each id and push one WAL entry per row
-          for (size_t i = 0; i < idListExpr->getArguments().size(); i++) {
-            auto idVal = idListExpr->getArguments()[i];
-            auto const* id = get_if<int32_t>(&idVal);
-            if(!id) continue;
-
-            // build: "Update"_("Customer"_, "id"_("List"_(5)), "Set"_(...))
+          visitRowIDs(*idListExpr, [&](auto idValue) {
             boss::ExpressionArguments walArgs;
             walArgs.push_back(*tableSymbol);
-            // use the real column name here
             boss::ExpressionArguments idListArgs;
-            idListArgs.push_back(*id);
+            idListArgs.push_back(idValue);
             auto idList = ComplexExpression("List"_, {}, std::move(idListArgs), {});
             boss::ExpressionArguments idColArgs;
             idColArgs.push_back(std::move(idList));
@@ -233,11 +283,9 @@ static Expression evaluate(Expression &&e) {
             writeAheadLog.push_back(
               ComplexExpression("Update"_, {}, std::move(walArgs), {})
             );
-          }
+          });
 
-          std::cout << "WAL: captured Update, " 
-                    << idListExpr->getArguments().size() 
-                    << " row(s)" << std::endl;
+          std::cout << "WAL: captured Update" << std::endl;
           return "Update_Logged"_();
         }
 
@@ -267,28 +315,19 @@ static Expression evaluate(Expression &&e) {
           idListExpr = get_if<ComplexExpression>(&listArg);
           if(!idListExpr) return std::move(expr);
 
-          // loop over each id and push one WAL entry per row
-          for(size_t i = 0; i < idListExpr->getArguments().size(); i++) {
-            auto idVal = idListExpr->getArguments()[i];
-            auto const* id = get_if<int32_t>(&idVal);
-            if(!id) continue;
-
-            // build: "Delete"_("Customer"_, "id"_("List"_(5)))
+          visitRowIDs(*idListExpr, [&](auto idValue) {
             boss::ExpressionArguments walArgs;
             walArgs.push_back(*tableSymbol);
             boss::ExpressionArguments idListArgs;
-            idListArgs.push_back(*id);
+            idListArgs.push_back(idValue);  // preserves original type
             auto idList = ComplexExpression("List"_, {}, std::move(idListArgs), {});
             boss::ExpressionArguments idColArgs;
             idColArgs.push_back(std::move(idList));
             walArgs.push_back(ComplexExpression(idColName, {}, std::move(idColArgs), {}));
-            writeAheadLog.push_back(
-              ComplexExpression("Delete"_, {}, std::move(walArgs), {})
-            );
-          }
-          std::cout << "WAL: captured Delete, "
-                    << idListExpr->getArguments().size()
-                    << " row(s)" << std::endl;
+            writeAheadLog.push_back(ComplexExpression("Delete"_, {}, std::move(walArgs), {}));
+          });
+
+          std::cout << "WAL: captured Delete" << std::endl;
           return "Delete_Logged"_();
         }
 
