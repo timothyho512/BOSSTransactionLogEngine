@@ -19,6 +19,9 @@ using boss::expressions::generic::get_if;
 // WAL - just a list of expression for now
 static std:: vector<Expression> writeAheadLog;
 
+// Threshold for WAL flush - when WAL reaches this size, flush to Arrow storage
+static const size_t WAL_THRESHOLD = 10;
+
 // Helper: extract table name from a WAL entry
 static std::string getTableName(ComplexExpression const& entry) {
   if(entry.getArguments().size() == 0) return "";
@@ -115,8 +118,139 @@ static void visitRowIDs(ComplexExpression const& idListExpr, Callback callback) 
   }
 }
 
+// Helper function for the optimsation rule
+
+// Check if a value expression contains any Symbol references
+// A Symbol in a value expression means it reads a column — making it a dependent write
+// e.g. Plus(price, 1) contains Symbol "price" → dependent write
+// e.g. 100.0 contains no Symbols → blind write
+static bool containsSymbol(Expression const& expr) {
+  if(get_if<Symbol>(&expr)) return true;
+  if(auto const* complex = get_if<ComplexExpression>(&expr)) {
+    for(size_t i = 0; i < complex->getArguments().size(); i++) {
+      if(containsSymbol(complex->cloneArgument(i))) return true;
+    }
+  }
+  return false;
+}
+
+// Check if a column assignment in Set(...) is a blind write
+// e.g. price(100.0) → blind write, price(Plus(price, 1)) → dependent write
+static bool isBlindWrite(ComplexExpression const& colAssign) {
+  if(colAssign.getArguments().empty()) return true;
+  return !containsSymbol(colAssign.cloneArgument(0));
+}
+
+// Helper to extract a double from any numeric Expression
+// returns nullopt if not a numeric concrete value
+static std::optional<double> toDouble(Expression const& expr) {
+  if(auto const* v = get_if<int32_t>(&expr))  return static_cast<double>(*v);
+  if(auto const* v = get_if<int64_t>(&expr))  return static_cast<double>(*v);
+  if(auto const* v = get_if<float>(&expr))    return static_cast<double>(*v);
+  if(auto const* v = get_if<double>(&expr))   return *v;
+  return std::nullopt;
+}
+
+// Attempt constant folding on a folded expression
+// handles same-operator chains where both constants are concrete numbers
+// e.g. Plus(Plus(price, 1.0), 1.0)   → Plus(price, 2.0)
+// e.g. Times(Times(price, 2.0), 3.0) → Times(price, 6.0)
+// e.g. Minus(Minus(price, 1.0), 2.0) → Minus(price, 3.0)
+// e.g. Divide(Divide(price, 2.0), 2.0) → Divide(price, 4.0)
+// returns nullopt if pattern doesn't match — expression stays as-is
+static std::optional<Expression> tryConstantFold(Expression const& expr) {
+  auto const* outer = get_if<ComplexExpression>(&expr);
+  if(!outer) return std::nullopt;
+  if(outer->getArguments().size() < 2) return std::nullopt;
+
+  auto const& outerHead = outer->getHead();
+
+  // only handle our four arithmetic operators
+  if(outerHead != "Plus"_  && outerHead != "Minus"_ &&
+     outerHead != "Times"_ && outerHead != "Divide"_) return std::nullopt;
+
+  // outer's first arg must be a ComplexExpression with the SAME operator
+  auto outerArg0 = outer->cloneArgument(0);
+  auto const* inner = get_if<ComplexExpression>(&outerArg0);
+  if(!inner) return std::nullopt;
+  if(inner->getHead() != outerHead) return std::nullopt;
+  if(inner->getArguments().size() < 2) return std::nullopt;
+
+  // inner's second arg must be a concrete number (c1)
+  auto c1Expr = inner->cloneArgument(1);
+  auto c1 = toDouble(c1Expr);
+  if(!c1) return std::nullopt;
+
+  // outer's second arg must be a concrete number (c2)
+  auto c2Expr = outer->cloneArgument(1);
+  auto c2 = toDouble(c2Expr);
+  if(!c2) return std::nullopt;
+
+  // compute the folded constant based on operator
+  double folded;
+  if(outerHead == "Plus"_)        folded = *c1 + *c2;
+  else if(outerHead == "Minus"_)  folded = *c1 + *c2; // Minus(Minus(x,a),b) = Minus(x, a+b)
+  else if(outerHead == "Times"_)  folded = *c1 * *c2;
+  else if(outerHead == "Divide"_) folded = *c1 * *c2; // Divide(Divide(x,a),b) = Divide(x, a*b)
+  else return std::nullopt;
+
+  // rebuild: outerHead(inner->arg0, folded)
+  boss::ExpressionArguments newArgs;
+  newArgs.push_back(inner->cloneArgument(0)); // the Symbol or deeper expression
+  newArgs.push_back(folded);
+  return ComplexExpression(outerHead, {}, std::move(newArgs), {});
+}
+
+// Fold two dependent writes on the same column into one composed expression
+// e.g. price(Plus(price, 1)) followed by price(Plus(price, 1))
+// becomes price(Plus(Plus(price, 1), 1))
+// the earlier write's value gets substituted as the "current value" for the later write
+static Expression foldColumnWrites(ComplexExpression const& earlier,
+                                   ComplexExpression const& later) {
+  // earlier = price(Plus(price, 1))
+  // later   = price(Plus(price, 1))
+  // result  = price(Plus(Plus(price, 1), 1))
+  // we substitute the earlier's value expression wherever 
+  // "price" Symbol appears in the later's value expression
+
+  auto colName = later.getHead(); // e.g. "price"
+  auto laterValue = later.cloneArgument(0); // e.g. Plus(price, 1)
+  auto earlierValue = earlier.cloneArgument(0); // e.g. Plus(price, 1)
+
+  // substitute colName Symbol in laterValue with earlierValue
+  std::function<Expression(Expression)> substitute = [&](Expression expr) -> Expression {
+    if(auto const* sym = get_if<Symbol>(&expr)) {
+      if(*sym == colName) return earlierValue.clone();
+      return expr;
+    }
+    if(auto const* complex = get_if<ComplexExpression>(&expr)) {
+      boss::ExpressionArguments newArgs;
+      for(size_t i = 0; i < complex->getArguments().size(); i++) {
+        newArgs.push_back(substitute(complex->cloneArgument(i)));
+      }
+      return ComplexExpression(complex->getHead(), {}, std::move(newArgs), {});
+    }
+    return expr;
+  };
+
+  auto foldedValue = substitute(std::move(laterValue));
+
+  // attempt constant folding — simplifies same-operator chains
+  // e.g. Plus(Plus(price, 1), 1) → Plus(price, 2)
+  if(auto simplified = tryConstantFold(foldedValue)) {
+    foldedValue = std::move(*simplified);
+  }
+
+  boss::ExpressionArguments colArgs;
+  colArgs.push_back(std::move(foldedValue));
+  return ComplexExpression(colName, {}, std::move(colArgs), {});
+}
+
 // OptimiseWAL - apply three optimisation rules:
-// 1. Last write wins on same row and column
+// Rule 1: later Update on same row and same column
+// if later write is blind → earlier is redundant (last-write-wins)
+// if later write is dependent → fold the two writes together into entry j
+//   by substituting entry i's value into entry j's expression
 // 2. Delete eliminates pending Updates on same row
 // 3. Merge Updates on same row with different columns
 static void optimiseWAL() {
@@ -137,35 +271,59 @@ static void optimiseWAL() {
         break;
       }
 
-      // Rule 1: later Update on same row and same column wins
-      if (entryI.getHead() == "Update"_ && entryJ.getHead() == "Update"_) {
-        // get "Set"_ from entryI - arg index 2
+      // Rule 1: later Update on same row and same column
+      // if later write is blind → earlier is redundant (last-write-wins)
+      // if later write is dependent → fold the two writes together into entry j
+      //   by substituting entry i's value into entry j's expression
+      if(entryI.getHead() == "Update"_ && entryJ.getHead() == "Update"_) {
         auto setArgI = entryI.getArguments()[2];
         auto const* setExprI = get_if<ComplexExpression>(&setArgI);
         if(!setExprI) continue;
-
-        // get "Set"_ from entryJ - arg index 2  
         auto setArgJ = entryJ.getArguments()[2];
         auto const* setExprJ = get_if<ComplexExpression>(&setArgJ);
         if(!setExprJ) continue;
 
-        // check if they share any column
-        for (size_t ci = 0; ci < setExprI->getArguments().size(); ci++) {
+        for(size_t ci = 0; ci < setExprI->getArguments().size(); ci++) {
           auto colIArg = setExprI->getArguments()[ci];
           auto const* colI = get_if<ComplexExpression>(&colIArg);
           if(!colI) continue;
-          for (size_t cj = 0; cj < setExprJ->getArguments().size(); cj++) {
+          for(size_t cj = 0; cj < setExprJ->getArguments().size(); cj++) {
             auto colJArg = setExprJ->getArguments()[cj];
             auto const* colJ = get_if<ComplexExpression>(&colJArg);
             if(!colJ) continue;
-            if(colI->getHead() == colJ->getHead()) {
+            if(colI->getHead() != colJ->getHead()) continue;
+
+            // same column — check if later write is blind or dependent
+            if(isBlindWrite(*colJ)) {
+              // blind write — earlier is simply redundant
               redundant = true;
-              break;
+            } else {
+              // dependent write — fold: substitute earlier value into later expression
+              // modify entry j in the WAL to contain the folded expression
+              auto& entryJMutable = get<ComplexExpression>(writeAheadLog[j]);
+              auto [jHead, jStatics, jArgs, jSpans] = std::move(entryJMutable).decompose();
+              auto setArgJMut = std::move(jArgs[2]);
+              auto [setHead, setStatics, setArgs, setSpans] = 
+                std::move(get<ComplexExpression>(setArgJMut)).decompose();
+
+              // replace the matching column in entry j's Set with the folded value
+              for(size_t k = 0; k < setArgs.size(); k++) {
+                auto const* setCol = get_if<ComplexExpression>(&setArgs[k]);
+                if(!setCol || setCol->getHead() != colI->getHead()) continue;
+                setArgs[k] = foldColumnWrites(*colI, *setCol);
+                break;
+              }
+
+              jArgs[2] = ComplexExpression(setHead, {}, std::move(setArgs), {});
+              writeAheadLog[j] = ComplexExpression(jHead, {}, std::move(jArgs), {});
+              redundant = true; // earlier entry is now absorbed into j
             }
+            break;
           }
-          if (redundant) break;
+          if(redundant) break;
         }
       }
+      if(redundant) break;
     }
     if(!redundant) {
       optimised.push_back(entryI.clone());
@@ -224,19 +382,26 @@ static void optimiseWAL() {
   writeAheadLog = std::move(merged);
 }
 
+// flushWAL - optimise and return all WAL entries as a List for Arrow storage to apply
+// called when WAL hit threshold
+static Expression flushWAL() {
+  std::cout << "WAL: flushing" << writeAheadLog.size() << " entries" << std::endl;
+  optimiseWAL();
+  std::cout << "WAL: " << writeAheadLog.size() << " entries after optimisation" << std::endl;
+
+  boss::ExpressionArguments entries;
+  for (auto& entry : writeAheadLog) {
+    entries.push_back(entry.clone());
+  }
+  writeAheadLog.clear();
+  return ComplexExpression("ApplyWAL"_, {}, std::move(entries), {});
+}
+
 static Expression evaluate(Expression &&e) {
   return std::visit(
     [](auto &&expr) -> Expression {
       if constexpr(std::is_same_v<std::decay_t<decltype(expr)>, ComplexExpression>) {
         auto head = expr.getHead();
-
-        // InsertInto - blind write, execute eagerly, pass through
-        // if (head == "InsertInto"_) {
-        //   std::cout << "WAL: InsertInto passing through eagerly" << std::endl;
-        //   // writeAheadLog.push_back(expr.clone());
-        //   // return "InsertInto_Logged"_();
-        //   return std::move(expr);
-        // }
 
         // Update - defer to WAL
         if (head == "Update"_) {
@@ -286,6 +451,12 @@ static Expression evaluate(Expression &&e) {
           });
 
           std::cout << "WAL: captured Update" << std::endl;
+
+          // check if WAL has hit the threshold - if so flush to Arrow storage
+          if(writeAheadLog.size() >= WAL_THRESHOLD) {
+            return flushWAL();
+          }
+
           return "Update_Logged"_();
         }
 
@@ -328,6 +499,12 @@ static Expression evaluate(Expression &&e) {
           });
 
           std::cout << "WAL: captured Delete" << std::endl;
+
+          // check if WAL has hit the threshold - if so flush to Arrow storage
+          if(writeAheadLog.size() >= WAL_THRESHOLD) {
+            return flushWAL();
+          }
+
           return "Delete_Logged"_();
         }
 
@@ -351,6 +528,30 @@ static Expression evaluate(Expression &&e) {
           optimiseWAL();
           std::cout << "WAL: " << writeAheadLog.size() << " entries after optimisation" << std::endl;
           return "WAL_Optimised"_();
+        }
+
+        // Select - triggers WAL flush before read
+        if(head == "Select"_) {
+          optimiseWAL();
+
+          // build ApplyWAL(Update(...), Delete(...), ..., Select(...))
+          boss::ExpressionArguments applyArgs;
+
+          // add all flushed WAL entries
+          for(auto& entry : writeAheadLog) {
+            applyArgs.push_back(entry.clone());
+          }
+          writeAheadLog.clear();
+
+          // add the original Select as the last argument
+          applyArgs.push_back(std::move(expr));
+
+          return ComplexExpression("ApplyWAL"_, {}, std::move(applyArgs), {});
+        }
+        
+        // for flushing the WAL
+        if(head == "FlushWAL"_) {
+            return flushWAL();
         }
       }
       return std::move(expr);
