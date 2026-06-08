@@ -108,6 +108,11 @@ static size_t walTotalEntries = 0;
  
 // Threshold for WAL flush
 static size_t WAL_THRESHOLD = 200'000'000;
+// V2A: reserve capacity for per-column WAL entry vectors.
+// The profiling run used chain length 100, so 128 gives enough space
+// for a typical hot row-column chain while keeping memory overhead modest.
+// reserve() changes vector capacity only; it does not create WAL entries.
+static constexpr size_t WAL_COLUMN_ENTRY_RESERVE = 128;
 
 // ============================================================
 // WAL instrumentation counters
@@ -534,7 +539,13 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
             singleUpdateArgs.push_back(std::move(singleSet));
             auto singleUpdate = ComplexExpression("Update"_, {}, std::move(singleUpdateArgs), {});
 
-            bucket.columnEntries[colName].push_back({std::move(singleUpdate), seq});
+            auto& colEntries = bucket.columnEntries[colName];
+
+            if(colEntries.empty()) {
+              colEntries.reserve(WAL_COLUMN_ENTRY_RESERVE);
+            }
+
+            colEntries.push_back({std::move(singleUpdate), seq});
             walTotalEntries++; // once per column, not once per Update
             #if BOSS_WAL_INSTRUMENTATION
             walStats.walEntriesCreated++;
@@ -755,8 +766,13 @@ static void optimiseBucketImpl(RowBucket& bucket) {
       for(size_t ci = 0; ci < setExpr->getArguments().size(); ci++) {
         auto colArg = setExpr->getArguments()[ci];
         if(auto const* colExpr = get_if<ComplexExpression>(&colArg)) {
-          bucket.columnEntries[colExpr->getHead().getName()].push_back(
-            {mergedUpdate.clone(), 0});
+          auto& colEntries = bucket.columnEntries[colExpr->getHead().getName()];
+
+          if(colEntries.empty()) {
+            colEntries.reserve(WAL_COLUMN_ENTRY_RESERVE);
+          }
+
+          colEntries.push_back({mergedUpdate.clone(), 0});
         }
       }
     }
