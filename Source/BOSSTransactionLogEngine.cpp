@@ -361,25 +361,73 @@ static void visitRowIDs(ComplexExpression const& idListExpr, Callback callback) 
 
 // Helper function for the optimsation rule
 
+static bool containsSymbol(Expression const& expr);
+
+template <typename T>
+static bool containsSymbolValue(T const& value);
+
+template <typename WrappedArgument>
+static bool containsSymbolArgument(WrappedArgument const& wrappedArg);
+
+template <typename T>
+static bool containsSymbolValue(T const& value) {
+  using Decayed = std::decay_t<T>;
+
+  if constexpr(std::is_same_v<Decayed, Symbol>) {
+    return true;
+  } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
+    auto const& args = value.getArguments();
+
+    for(auto const& arg : args) {
+      if(containsSymbolArgument(arg)) return true;
+    }
+
+    return false;
+  } else if constexpr(std::is_same_v<Decayed, Expression>) {
+    return containsSymbol(value);
+  } else {
+    return false;
+  }
+}
+
+template <typename WrappedArgument>
+static bool containsSymbolArgument(WrappedArgument const& wrappedArg) {
+  return std::visit(
+    [](auto const& unwrapped) -> bool {
+      using Decayed = std::decay_t<decltype(unwrapped)>;
+
+      if constexpr(boss::utilities::isInstanceOfTemplate<
+                     Decayed, boss::expressions::generic::MovableReferenceWrapper>::value) {
+        return containsSymbolValue(unwrapped.get());
+      } else {
+        return containsSymbolValue(unwrapped);
+      }
+    },
+    wrappedArg.getArgument()
+  );
+}
+
 // Check if a value expression contains any Symbol references
 // A Symbol in a value expression means it reads a column — making it a dependent write
 // e.g. Plus(price, 1) contains Symbol "price" → dependent write
 // e.g. 100.0 contains no Symbols → blind write
 static bool containsSymbol(Expression const& expr) {
-  if(get_if<Symbol>(&expr)) return true;
-  if(auto const* complex = get_if<ComplexExpression>(&expr)) {
-    for(size_t i = 0; i < complex->getArguments().size(); i++) {
-      if(containsSymbol(complex->cloneArgument(i))) return true;
-    }
-  }
-  return false;
+  return std::visit(
+    [](auto const& value) -> bool {
+      return containsSymbolValue(value);
+    },
+    expr
+  );
 }
 
 // Check if a column assignment in Set(...) is a blind write
 // e.g. price(100.0) → blind write, price(Plus(price, 1)) → dependent write
 static bool isBlindWrite(ComplexExpression const& colAssign) {
-  if(colAssign.getArguments().empty()) return true;
-  return !containsSymbol(colAssign.cloneArgument(0));
+  auto const& args = colAssign.getArguments();
+
+  if(args.empty()) return true;
+
+  return !containsSymbolArgument(args[0]);
 }
 
 // Helper to extract a double from any numeric Expression
