@@ -73,6 +73,7 @@ struct WALKeyHash {
 struct WALEntry {
   Expression expr;
   int seq;
+  bool isBlindWrite = false; // true if this entry is a blind write (no Symbol dependencies)
 };
 
 // SelectTarget — result of parsing a Select or Project(Select(...)) expression
@@ -593,7 +594,8 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
               colEntries.reserve(WAL_COLUMN_ENTRY_RESERVE);
             }
 
-            colEntries.push_back({std::move(singleUpdate), seq});
+            bool blind = isBlindWrite(*colExpr);
+            colEntries.push_back({std::move(singleUpdate), seq, blind});
             walTotalEntries++; // once per column, not once per Update
             #if BOSS_WAL_INSTRUMENTATION
             walStats.walEntriesCreated++;
@@ -606,7 +608,7 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
       // but Delete is captured independently so seq reflects actual arrival order
       int seq = bucket.nextSeq++;
       if(!bucket.deleteEntry.has_value() || seq > bucket.deleteEntry->seq) {
-        bucket.deleteEntry = {walEntry.clone(), seq};
+        bucket.deleteEntry = {walEntry.clone(), seq, false};
       }
       walTotalEntries++;
       #if BOSS_WAL_INSTRUMENTATION
@@ -668,7 +670,7 @@ static std::optional<Expression> resolveColumnEntries(
  
     if(!resolvedValue.has_value()) {
       // first (latest) entry for this column
-      if(isBlindWrite(*colAssign)) {
+      if(walEntry.isBlindWrite) {
         resolvedValue = colAssign->clone();
         break; // Rule 1a: blind write, stop immediately
       } else {
@@ -677,7 +679,7 @@ static std::optional<Expression> resolveColumnEntries(
     } else {
       auto const* resolvedExpr = get_if<ComplexExpression>(&*resolvedValue);
       if(!resolvedExpr) break;
-      if(isBlindWrite(*colAssign)) {
+      if(walEntry.isBlindWrite) {
         resolvedValue = foldColumnWrites(*colAssign, *resolvedExpr);
         break; // blind base found, stop
       } else {
@@ -820,7 +822,8 @@ static void optimiseBucketImpl(RowBucket& bucket) {
             colEntries.reserve(WAL_COLUMN_ENTRY_RESERVE);
           }
 
-          colEntries.push_back({mergedUpdate.clone(), 0});
+          bool blind = isBlindWrite(*colExpr);
+          colEntries.push_back({mergedUpdate.clone(), 0, blind});
         }
       }
     }
