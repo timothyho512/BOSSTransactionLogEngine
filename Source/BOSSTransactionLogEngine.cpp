@@ -500,30 +500,80 @@ static Expression foldColumnWrites(ComplexExpression const& earlier,
   // earlier = price(Plus(price, 1))
   // later   = price(Plus(price, 1))
   // result  = price(Plus(Plus(price, 1), 1))
-  // we substitute the earlier's value expression wherever 
+  // we substitute the earlier's value expression wherever
   // "price" Symbol appears in the later's value expression
 
   auto colName = later.getHead(); // e.g. "price"
-  auto laterValue = later.cloneArgument(0); // e.g. Plus(price, 1)
-  auto earlierValue = earlier.cloneArgument(0); // e.g. Plus(price, 1)
 
-  // substitute colName Symbol in laterValue with earlierValue
-  std::function<Expression(Expression)> substitute = [&](Expression expr) -> Expression {
-    if(auto const* sym = get_if<Symbol>(&expr)) {
-      if(*sym == colName) return earlierValue.clone();
-      return expr;
-    }
-    if(auto const* complex = get_if<ComplexExpression>(&expr)) {
+  // We still need an owned copy of the earlier value because it may be inserted
+  // into the new folded expression wherever the column Symbol is found.
+  auto earlierValue = earlier.cloneArgument(0);
+
+  std::function<Expression(Expression const&)> substituteExpr;
+
+  auto substituteValue = [&](auto const& value) -> Expression {
+    using Decayed = std::decay_t<decltype(value)>;
+
+    if constexpr(std::is_same_v<Decayed, Symbol>) {
+      if(value == colName) return earlierValue.clone();
+      return value;
+    } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
       boss::ExpressionArguments newArgs;
-      for(size_t i = 0; i < complex->getArguments().size(); i++) {
-        newArgs.push_back(substitute(complex->cloneArgument(i)));
+      auto const& args = value.getArguments();
+
+      for(auto const& arg : args) {
+        newArgs.push_back(std::visit(
+          [&](auto const& unwrapped) -> Expression {
+            using Inner = std::decay_t<decltype(unwrapped)>;
+
+            if constexpr(boss::utilities::isInstanceOfTemplate<
+                           Inner, boss::expressions::generic::MovableReferenceWrapper>::value) {
+              return substituteExpr(unwrapped.get());
+            } else {
+              return substituteExpr(unwrapped);
+            }
+          },
+          arg.getArgument()
+        ));
       }
-      return ComplexExpression(complex->getHead(), {}, std::move(newArgs), {});
+
+      return ComplexExpression(value.getHead(), {}, std::move(newArgs), {});
+    } else if constexpr(std::is_same_v<Decayed, Expression>) {
+      return substituteExpr(value);
+    } else {
+      return value;
     }
-    return expr;
   };
 
-  auto foldedValue = substitute(std::move(laterValue));
+  substituteExpr = [&](Expression const& expr) -> Expression {
+    return std::visit(
+      [&](auto const& value) -> Expression {
+        return substituteValue(value);
+      },
+      expr
+    );
+  };
+
+  auto const& laterArgs = later.getArguments();
+  if(laterArgs.empty()) {
+    boss::ExpressionArguments colArgs;
+    colArgs.push_back(earlierValue.clone());
+    return ComplexExpression(colName, {}, std::move(colArgs), {});
+  }
+
+  auto foldedValue = std::visit(
+    [&](auto const& unwrapped) -> Expression {
+      using Inner = std::decay_t<decltype(unwrapped)>;
+
+      if constexpr(boss::utilities::isInstanceOfTemplate<
+                     Inner, boss::expressions::generic::MovableReferenceWrapper>::value) {
+        return substituteExpr(unwrapped.get());
+      } else {
+        return substituteExpr(unwrapped);
+      }
+    },
+    laterArgs[0].getArgument()
+  );
 
   // attempt constant folding — simplifies same-operator chains
   // e.g. Plus(Plus(price, 1), 1) → Plus(price, 2)
