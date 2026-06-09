@@ -512,6 +512,26 @@ static Expression cloneWrappedArgument(WrappedArgument const& wrappedArg) {
   );
 }
 
+// Visit an argument by reference without cloning.
+// Use this when we only need to inspect an argument, not store it.
+template <typename WrappedArgument, typename Visitor>
+static decltype(auto) visitArgumentByReference(WrappedArgument const& wrappedArg,
+                                               Visitor&& visitor) {
+  return std::visit(
+    [&](auto const& unwrapped) -> decltype(auto) {
+      using Decayed = std::decay_t<decltype(unwrapped)>;
+
+      if constexpr(boss::utilities::isInstanceOfTemplate<
+                     Decayed, boss::expressions::generic::MovableReferenceWrapper>::value) {
+        return visitor(unwrapped.get());
+      } else {
+        return visitor(unwrapped);
+      }
+    },
+    wrappedArg.getArgument()
+  );
+}
+
 // Attempt constant folding on a folded expression
 // handles same-operator chains where both constants are concrete numbers
 // e.g. Plus(Plus(price, 1.0), 1.0)   → Plus(price, 2.0)
@@ -704,16 +724,16 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
     if(entry->getHead() == "Update"_ && entry->getArguments().size() >= 3) {
       // grab table name and id expression — shared across all columns in this Update
       // we need these to reconstruct a per-column Update expression for each column
-      auto tableArg = entry->cloneArgument(0); // e.g. Symbol "Customer"
-      auto idArg    = entry->cloneArgument(1); // e.g. id(List(5))
+      auto const& tableArg = entry->getArguments()[0]; // e.g. Symbol "Customer"
+      auto const& idArg    = entry->getArguments()[1]; // e.g. id(List(5))
 
-      auto setArg = entry->getArguments()[2];
+      auto const& setArg = entry->getArguments()[2];
       if(auto const* setExpr = get_if<ComplexExpression>(&setArg)) {
         // iterate columns in Set(...) in order — order matters for cross-column dependencies
         // e.g. Set(price(100), total(Times(price, 2))) — price must come before total
         // we assign a fresh seq to each column so they sort correctly at flush time
         for(size_t ci = 0; ci < setExpr->getArguments().size(); ci++) {
-          auto colArg = setExpr->getArguments()[ci];
+          auto const& colArg = setExpr->getArguments()[ci];
           if(auto const* colExpr = get_if<ComplexExpression>(&colArg)) {
             std::string colName = colExpr->getHead().getName();
 
@@ -729,8 +749,8 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
             auto singleSet = ComplexExpression("Set"_, {}, std::move(singleSetArgs), {});
 
             boss::ExpressionArguments singleUpdateArgs;
-            singleUpdateArgs.push_back(tableArg.clone()); // table name
-            singleUpdateArgs.push_back(idArg.clone());    // row id
+            singleUpdateArgs.push_back(cloneWrappedArgument(tableArg)); // table name
+            singleUpdateArgs.push_back(cloneWrappedArgument(idArg));    // row id
             singleUpdateArgs.push_back(std::move(singleSet));
             auto singleUpdate = ComplexExpression("Update"_, {}, std::move(singleUpdateArgs), {});
 
@@ -845,14 +865,48 @@ static std::optional<Expression> resolveColumnEntries(
 // contains Symbol "price", and "price" is a column in the same bucket,
 // then X depends on price.
  
+template <typename T>
+static void collectSymbolNamesValue(T const& value, std::vector<std::string>& names);
+
+template <typename WrappedArgument>
+static void collectSymbolNamesArgument(WrappedArgument const& wrappedArg,
+                                       std::vector<std::string>& names) {
+  visitArgumentByReference(
+    wrappedArg,
+    [&](auto const& unwrapped) {
+      collectSymbolNamesValue(unwrapped, names);
+    }
+  );
+}
+
 static void collectSymbolNames(Expression const& expr, std::vector<std::string>& names) {
-  if(auto const* sym = get_if<Symbol>(&expr)) {
-    names.push_back(sym->getName());
-    return;
-  }
-  if(auto const* complex = get_if<ComplexExpression>(&expr)) {
-    for(size_t i = 0; i < complex->getArguments().size(); i++)
-      collectSymbolNames(complex->cloneArgument(i), names);
+  std::visit(
+    [&](auto const& value) {
+      collectSymbolNamesValue(value, names);
+    },
+    expr
+  );
+}
+
+template <typename T>
+static void collectSymbolNamesValue(T const& value, std::vector<std::string>& names) {
+  using Decayed = std::decay_t<T>;
+
+  if constexpr(boss::utilities::isInstanceOfTemplate<
+                 Decayed, boss::expressions::generic::MovableReferenceWrapper>::value) {
+    collectSymbolNamesValue(value.get(), names);
+  } else if constexpr(std::is_same_v<Decayed, Symbol>) {
+    names.push_back(value.getName());
+  } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
+    auto const& args = value.getArguments();
+
+    for(auto const& arg : args) {
+      collectSymbolNamesArgument(arg, names);
+    }
+  } else if constexpr(std::is_same_v<Decayed, Expression>) {
+    collectSymbolNames(value, names);
+  } else {
+    // concrete literals do not contain Symbol dependencies
   }
 }
 
@@ -957,10 +1011,10 @@ static void optimiseBucketImpl(RowBucket& bucket) {
  
     // re-register the merged Update's columns at seq 0 in the new columnEntries
     // (all at the same seq since they are now a single compacted entry)
-    auto setArg = mergedUpdate.getArguments()[2];
+    auto const& setArg = mergedUpdate.getArguments()[2];
     if(auto const* setExpr = get_if<ComplexExpression>(&setArg)) {
       for(size_t ci = 0; ci < setExpr->getArguments().size(); ci++) {
-        auto colArg = setExpr->getArguments()[ci];
+        auto const& colArg = setExpr->getArguments()[ci];
         if(auto const* colExpr = get_if<ComplexExpression>(&colArg)) {
           auto& colEntries = bucket.columnEntries[colExpr->getHead().getName()];
 
@@ -1197,7 +1251,7 @@ static std::vector<Expression> flushBucket(
       }
 
       // grab the column assignment from Set's first argument
-      auto setArg = entryExpr->getArguments()[2];
+      auto const& setArg = entryExpr->getArguments()[2];
       auto const* setExpr = get_if<ComplexExpression>(&setArg);
       if(!setExpr || setExpr->getArguments().size() < 1) continue;
 
