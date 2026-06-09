@@ -441,6 +441,77 @@ static std::optional<double> toDouble(Expression const& expr) {
   return std::nullopt;
 }
 
+// Read a numeric value from either a raw atom, an Expression, or a BOSS wrapper.
+// This avoids cloneArgument() when tryConstantFold only needs to inspect constants.
+template <typename T>
+static std::optional<double> toDoubleValue(T const& value) {
+  using Decayed = std::decay_t<T>;
+
+  if constexpr(boss::utilities::isInstanceOfTemplate<
+                 Decayed, boss::expressions::generic::MovableReferenceWrapper>::value) {
+    return toDoubleValue(value.get());
+  } else if constexpr(std::is_same_v<Decayed, int32_t>) {
+    return static_cast<double>(value);
+  } else if constexpr(std::is_same_v<Decayed, int64_t>) {
+    return static_cast<double>(value);
+  } else if constexpr(std::is_same_v<Decayed, float>) {
+    return static_cast<double>(value);
+  } else if constexpr(std::is_same_v<Decayed, double>) {
+    return value;
+  } else if constexpr(std::is_same_v<Decayed, Expression>) {
+    return toDouble(value);
+  } else {
+    return std::nullopt;
+  }
+}
+
+// Read a ComplexExpression pointer from either a raw ComplexExpression,
+// an Expression, or a BOSS wrapper.
+// This avoids cloning an argument just to check whether it is a ComplexExpression.
+template <typename T>
+static ComplexExpression const* asComplexExpressionPtr(T const& value) {
+  using Decayed = std::decay_t<T>;
+
+  if constexpr(boss::utilities::isInstanceOfTemplate<
+                 Decayed, boss::expressions::generic::MovableReferenceWrapper>::value) {
+    return asComplexExpressionPtr(value.get());
+  } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
+    return &value;
+  } else if constexpr(std::is_same_v<Decayed, Expression>) {
+    return get_if<ComplexExpression>(&value);
+  } else {
+    return nullptr;
+  }
+}
+
+// Create an owned Expression from an existing argument only when rebuilding
+// the simplified expression. This keeps ownership cloning only at output time.
+template <typename T>
+static Expression cloneExpressionValue(T const& value) {
+  using Decayed = std::decay_t<T>;
+
+  if constexpr(boss::utilities::isInstanceOfTemplate<
+                 Decayed, boss::expressions::generic::MovableReferenceWrapper>::value) {
+    return cloneExpressionValue(value.get());
+  } else if constexpr(std::is_same_v<Decayed, Expression>) {
+    return value.clone();
+  } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
+    return value.clone();
+  } else {
+    return value;
+  }
+}
+
+template <typename WrappedArgument>
+static Expression cloneWrappedArgument(WrappedArgument const& wrappedArg) {
+  return std::visit(
+    [](auto const& unwrapped) -> Expression {
+      return cloneExpressionValue(unwrapped);
+    },
+    wrappedArg.getArgument()
+  );
+}
+
 // Attempt constant folding on a folded expression
 // handles same-operator chains where both constants are concrete numbers
 // e.g. Plus(Plus(price, 1.0), 1.0)   → Plus(price, 2.0)
@@ -451,7 +522,9 @@ static std::optional<double> toDouble(Expression const& expr) {
 static std::optional<Expression> tryConstantFold(Expression const& expr) {
   auto const* outer = get_if<ComplexExpression>(&expr);
   if(!outer) return std::nullopt;
-  if(outer->getArguments().size() < 2) return std::nullopt;
+
+  auto const& outerArgs = outer->getArguments();
+  if(outerArgs.size() < 2) return std::nullopt;
 
   auto const& outerHead = outer->getHead();
 
@@ -459,21 +532,41 @@ static std::optional<Expression> tryConstantFold(Expression const& expr) {
   if(outerHead != "Plus"_  && outerHead != "Minus"_ &&
      outerHead != "Times"_ && outerHead != "Divide"_) return std::nullopt;
 
-  // outer's first arg must be a ComplexExpression with the SAME operator
-  auto outerArg0 = outer->cloneArgument(0);
-  auto const* inner = get_if<ComplexExpression>(&outerArg0);
+  // outer's first arg must be a ComplexExpression with the SAME operator.
+  // V2E-A: inspect by wrapper/reference instead of cloneArgument(0).
+  auto const* inner = std::visit(
+    [](auto const& unwrapped) -> ComplexExpression const* {
+      return asComplexExpressionPtr(unwrapped);
+    },
+    outerArgs[0].getArgument()
+  );
+
   if(!inner) return std::nullopt;
   if(inner->getHead() != outerHead) return std::nullopt;
-  if(inner->getArguments().size() < 2) return std::nullopt;
 
-  // inner's second arg must be a concrete number (c1)
-  auto c1Expr = inner->cloneArgument(1);
-  auto c1 = toDouble(c1Expr);
+  auto const& innerArgs = inner->getArguments();
+  if(innerArgs.size() < 2) return std::nullopt;
+
+  // inner's second arg must be a concrete number (c1).
+  // V2E-A: inspect by wrapper/reference instead of cloneArgument(1).
+  auto c1 = std::visit(
+    [](auto const& unwrapped) -> std::optional<double> {
+      return toDoubleValue(unwrapped);
+    },
+    innerArgs[1].getArgument()
+  );
+
   if(!c1) return std::nullopt;
 
-  // outer's second arg must be a concrete number (c2)
-  auto c2Expr = outer->cloneArgument(1);
-  auto c2 = toDouble(c2Expr);
+  // outer's second arg must be a concrete number (c2).
+  // V2E-A: inspect by wrapper/reference instead of cloneArgument(1).
+  auto c2 = std::visit(
+    [](auto const& unwrapped) -> std::optional<double> {
+      return toDoubleValue(unwrapped);
+    },
+    outerArgs[1].getArgument()
+  );
+
   if(!c2) return std::nullopt;
 
   // compute the folded constant based on operator
@@ -484,10 +577,13 @@ static std::optional<Expression> tryConstantFold(Expression const& expr) {
   else if(outerHead == "Divide"_) folded = *c1 * *c2; // Divide(Divide(x,a),b) = Divide(x, a*b)
   else return std::nullopt;
 
-  // rebuild: outerHead(inner->arg0, folded)
+  // Rebuild: outerHead(inner->arg0, folded)
+  // We still need an owned copy of inner arg0 because it becomes part of
+  // the new simplified expression.
   boss::ExpressionArguments newArgs;
-  newArgs.push_back(inner->cloneArgument(0)); // the Symbol or deeper expression
+  newArgs.push_back(cloneWrappedArgument(innerArgs[0]));
   newArgs.push_back(folded);
+
   return ComplexExpression(outerHead, {}, std::move(newArgs), {});
 }
 
