@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <string>
 #include <cstdint>
+#include <functional>
 
 #ifndef BOSS_WAL_INSTRUMENTATION
 #define BOSS_WAL_INSTRUMENTATION 1
@@ -607,6 +608,57 @@ static std::optional<Expression> tryConstantFold(Expression const& expr) {
   return ComplexExpression(outerHead, {}, std::move(newArgs), {});
 }
 
+template <typename WrappedArgument>
+static size_t countSymbolOccurrencesArgument(WrappedArgument const& wrappedArg,
+                                             Symbol const& target);
+
+static size_t countSymbolOccurrences(Expression const& expr, Symbol const& target);
+
+template <typename T>
+static size_t countSymbolOccurrencesValue(T const& value, Symbol const& target) {
+  using Decayed = std::decay_t<T>;
+
+  if constexpr(boss::utilities::isInstanceOfTemplate<
+                 Decayed, boss::expressions::generic::MovableReferenceWrapper>::value) {
+    return countSymbolOccurrencesValue(value.get(), target);
+  } else if constexpr(std::is_same_v<Decayed, Symbol>) {
+    return value == target ? 1 : 0;
+  } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
+    size_t count = 0;
+    auto const& args = value.getArguments();
+
+    for(auto const& arg : args) {
+      count += countSymbolOccurrencesArgument(arg, target);
+    }
+
+    return count;
+  } else if constexpr(std::is_same_v<Decayed, Expression>) {
+    return countSymbolOccurrences(value, target);
+  } else {
+    return 0;
+  }
+}
+
+template <typename WrappedArgument>
+static size_t countSymbolOccurrencesArgument(WrappedArgument const& wrappedArg,
+                                             Symbol const& target) {
+  return visitArgumentByReference(
+    wrappedArg,
+    [&](auto const& unwrapped) -> size_t {
+      return countSymbolOccurrencesValue(unwrapped, target);
+    }
+  );
+}
+
+static size_t countSymbolOccurrences(Expression const& expr, Symbol const& target) {
+  return std::visit(
+    [&](auto const& value) -> size_t {
+      return countSymbolOccurrencesValue(value, target);
+    },
+    expr
+  );
+}
+
 // Fold two dependent writes on the same column into one composed expression
 // e.g. price(Plus(price, 1)) followed by price(Plus(price, 1))
 // becomes price(Plus(Plus(price, 1), 1))
@@ -621,9 +673,21 @@ static Expression foldColumnWrites(ComplexExpression const& earlier,
 
   auto colName = later.getHead(); // e.g. "price"
 
-  // We still need an owned copy of the earlier value because it may be inserted
-  // into the new folded expression wherever the column Symbol is found.
+  auto const& laterArgs = later.getArguments();
+
+  // Count how many times the later expression refers to this column.
+  // If it appears once, we can move earlierValue into the folded expression.
+  // If it appears more than once, we must clone for each replacement.
+  size_t replacementCount = 0;
+
+  if(!laterArgs.empty()) {
+    replacementCount = countSymbolOccurrencesArgument(laterArgs[0], colName);
+  }
+
   auto earlierValue = earlier.cloneArgument(0);
+
+  bool canMoveEarlierValue = replacementCount == 1;
+  bool earlierValueMoved = false;
 
   std::function<Expression(Expression const&)> substituteExpr;
 
@@ -631,11 +695,20 @@ static Expression foldColumnWrites(ComplexExpression const& earlier,
     using Decayed = std::decay_t<decltype(value)>;
 
     if constexpr(std::is_same_v<Decayed, Symbol>) {
-      if(value == colName) return earlierValue.clone();
+      if(value == colName) {
+        if(canMoveEarlierValue && !earlierValueMoved) {
+          earlierValueMoved = true;
+          return std::move(earlierValue);
+        }
+
+        return earlierValue.clone();
+      }
+
       return value;
     } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
       boss::ExpressionArguments newArgs;
       auto const& args = value.getArguments();
+      newArgs.reserve(args.size());
 
       for(auto const& arg : args) {
         newArgs.push_back(std::visit(
@@ -670,10 +743,9 @@ static Expression foldColumnWrites(ComplexExpression const& earlier,
     );
   };
 
-  auto const& laterArgs = later.getArguments();
   if(laterArgs.empty()) {
     boss::ExpressionArguments colArgs;
-    colArgs.push_back(earlierValue.clone());
+    colArgs.push_back(std::move(earlierValue));
     return ComplexExpression(colName, {}, std::move(colArgs), {});
   }
 
@@ -825,12 +897,12 @@ static std::optional<Expression> resolveColumnEntries(
     auto const* entryExpr = get_if<ComplexExpression>(&walEntry.expr);
     if(!entryExpr || entryExpr->getArguments().size() < 3) continue;
  
-    auto setArg = entryExpr->getArguments()[2];
+    auto const& setArg = entryExpr->getArguments()[2];
     auto const* setExpr = get_if<ComplexExpression>(&setArg);
     if(!setExpr) continue;
  
     // Set contains exactly one column after Change 1 — read it directly
-    auto colArg = setExpr->getArguments()[0];
+    auto const& colArg = setExpr->getArguments()[0];
     auto const* colAssign = get_if<ComplexExpression>(&colArg);
     if(!colAssign) continue;
  
