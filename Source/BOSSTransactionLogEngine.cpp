@@ -789,13 +789,16 @@ static Expression foldColumnWrites(ComplexExpression const& earlier,
 // O(c) per write — one push per column in Set(...)
 
 static void walIndexPush(WALKey const& key, Expression walEntry) {
-  // create bucket if this is the first entry for this row
-  if(walIndex.find(key) == walIndex.end()) {
-    walIndex[key] = RowBucket{};
+  // Create bucket if this is the first entry for this row.
+  // V2J: use try_emplace to avoid find(key) followed by walIndex[key],
+  // which performs repeated hash-table lookup work.
+  auto [bucketIt, inserted] = walIndex.try_emplace(key);
+
+  if(inserted) {
     walOrder.push_back(key);
   }
 
-  RowBucket& bucket = walIndex[key];
+  RowBucket& bucket = bucketIt->second;
 
   if(auto const* entry = get_if<ComplexExpression>(&walEntry)) {
     if(entry->getHead() == "Update"_ && entry->getArguments().size() >= 3) {
@@ -806,6 +809,10 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
 
       auto const& setArg = entry->getArguments()[2];
       if(auto const* setExpr = get_if<ComplexExpression>(&setArg)) {
+        if(!bucket.tableName.has_value()) {
+          bucket.tableName = cloneWrappedArgument(tableArg);
+          bucket.idExpr    = cloneWrappedArgument(idArg);
+        }
         // iterate columns in Set(...) in order — order matters for cross-column dependencies
         // e.g. Set(price(100), total(Times(price, 2))) — price must come before total
         // we assign a fresh seq to each column so they sort correctly at flush time
@@ -814,20 +821,12 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
           if(auto const* colExpr = get_if<ComplexExpression>(&colArg)) {
             std::string colName = colExpr->getHead().getName();
 
-            // assign a unique seq for this column — increments per column not per Update
-            // this ensures columns from the same Update sort in their original order
             int seq = bucket.nextSeq++;
 
-            // Store table name and row id once per row bucket.
-            // Every column entry in this bucket belongs to the same table and row.
-            if(!bucket.tableName.has_value()) {
-              bucket.tableName = cloneWrappedArgument(tableArg);
-              bucket.idExpr    = cloneWrappedArgument(idArg);
-            }
+            auto [colIt, colInserted] = bucket.columnEntries.try_emplace(colName);
+            auto& colEntries = colIt->second;
 
-            auto& colEntries = bucket.columnEntries[colName];
-
-            if(colEntries.empty()) {
+            if(colInserted) {
               colEntries.reserve(WAL_COLUMN_ENTRY_RESERVE);
             }
 
