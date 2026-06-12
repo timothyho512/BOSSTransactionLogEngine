@@ -87,15 +87,20 @@ struct SelectTarget {
 
  
 struct RowBucket {
-  // per-column entry lists — each column has its own independent vector
-  // key = column name, value = entries in arrival order (seq ascending)
+  // per-column entry lists
+  // Before V2H, each WALEntry stored a single-column Update(...)
+  // After V2H, each WALEntry stores only the column assignment, e.g. price(...)
   std::unordered_map<std::string, std::vector<WALEntry>> columnEntries;
- 
-  // latest Delete for this row — stored separately since Delete is not a column write
-  // seq inside deleteEntry tells us which column entries it supersedes (those with seq < deleteEntry.seq)
+
+  // latest Delete for this row
   std::optional<WALEntry> deleteEntry;
- 
-  // monotonically increasing counter — assigned to each new entry across all columns
+
+  // table and row id are the same for every entry in this row bucket
+  // so store them once instead of cloning them into every column entry
+  std::optional<Expression> tableName;
+  std::optional<Expression> idExpr;
+
+  // monotonically increasing counter across columns
   int nextSeq = 0;
 };
  
@@ -813,18 +818,12 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
             // this ensures columns from the same Update sort in their original order
             int seq = bucket.nextSeq++;
 
-            // build a new Update containing only this column in its Set
-            // e.g. Update(Customer, id(List(5)), Set(price(100)))
-            // storing only the relevant column avoids redundant data per entry
-            boss::ExpressionArguments singleSetArgs;
-            singleSetArgs.push_back(colExpr->clone()); // just this column assignment
-            auto singleSet = ComplexExpression("Set"_, {}, std::move(singleSetArgs), {});
-
-            boss::ExpressionArguments singleUpdateArgs;
-            singleUpdateArgs.push_back(cloneWrappedArgument(tableArg)); // table name
-            singleUpdateArgs.push_back(cloneWrappedArgument(idArg));    // row id
-            singleUpdateArgs.push_back(std::move(singleSet));
-            auto singleUpdate = ComplexExpression("Update"_, {}, std::move(singleUpdateArgs), {});
+            // Store table name and row id once per row bucket.
+            // Every column entry in this bucket belongs to the same table and row.
+            if(!bucket.tableName.has_value()) {
+              bucket.tableName = cloneWrappedArgument(tableArg);
+              bucket.idExpr    = cloneWrappedArgument(idArg);
+            }
 
             auto& colEntries = bucket.columnEntries[colName];
 
@@ -833,7 +832,7 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
             }
 
             bool blind = isBlindWrite(*colExpr);
-            colEntries.push_back({std::move(singleUpdate), seq, blind});
+            colEntries.push_back({colExpr->clone(), seq, blind});
             walTotalEntries++; // once per column, not once per Update
             #if BOSS_WAL_INSTRUMENTATION
             walStats.walEntriesCreated++;
@@ -893,18 +892,11 @@ static std::optional<Expression> resolveColumnEntries(
     // discard entries at or before the delete seq
     if(bucket.deleteEntry.has_value() && walEntry.seq <= bucket.deleteEntry->seq) break;
  
-    // extract the column assignment for colName from this entry's Set(...)
-    auto const* entryExpr = get_if<ComplexExpression>(&walEntry.expr);
-    if(!entryExpr || entryExpr->getArguments().size() < 3) continue;
- 
-    auto const& setArg = entryExpr->getArguments()[2];
-    auto const* setExpr = get_if<ComplexExpression>(&setArg);
-    if(!setExpr) continue;
- 
-    // Set contains exactly one column after Change 1 — read it directly
-    auto const& colArg = setExpr->getArguments()[0];
-    auto const* colAssign = get_if<ComplexExpression>(&colArg);
+    // V2H: each WAL entry now stores the column assignment directly,
+    // e.g. price(...), not Update(..., Set(price(...))).
+    auto const* colAssign = get_if<ComplexExpression>(&walEntry.expr);
     if(!colAssign) continue;
+
  
     if(!resolvedValue.has_value()) {
       // first (latest) entry for this column
@@ -1022,10 +1014,6 @@ static void optimiseBucketImpl(RowBucket& bucket) {
   };
   std::vector<ResolvedCol> resolved;
  
-  // save table name and id for rebuilding the Update expression
-  std::optional<Expression> savedTableName;
-  std::optional<Expression> savedIdExpr;
- 
   for(auto const& [colName, entries] : bucket.columnEntries) {
     // find the latest surviving entry seq for this column
     int colLatestSeq = -1;
@@ -1037,20 +1025,6 @@ static void optimiseBucketImpl(RowBucket& bucket) {
     // resolve this column's entries
     auto result = resolveColumnEntries(colName, entries, bucket, maxSeq);
     if(!result.has_value()) continue;
- 
-    // grab table name and id from any surviving entry
-    if(!savedTableName.has_value()) {
-      for(auto const& e : entries) {
-        if(e.seq > deleteSeq) {
-          auto const* entryExpr = get_if<ComplexExpression>(&e.expr);
-          if(entryExpr && entryExpr->getArguments().size() >= 2) {
-            savedTableName = entryExpr->cloneArgument(0);
-            savedIdExpr    = entryExpr->cloneArgument(1);
-            break;
-          }
-        }
-      }
-    }
  
     resolved.push_back({std::move(*result), colLatestSeq});
   }
@@ -1066,41 +1040,31 @@ static void optimiseBucketImpl(RowBucket& bucket) {
     });
  
   // clear the old column entries
+  // clear the old column entries
   bucket.columnEntries.clear();
- 
-  // rebuild: one merged Update with all surviving columns in seq order
-  if(!resolved.empty() && savedTableName.has_value()) {
-    boss::ExpressionArguments resolvedCols;
-    for(auto& rc : resolved) {
-      resolvedCols.push_back(std::move(rc.expr));
-    }
- 
-    boss::ExpressionArguments updateArgs;
-    updateArgs.push_back(std::move(*savedTableName));
-    updateArgs.push_back(std::move(*savedIdExpr));
-    updateArgs.push_back(ComplexExpression("Set"_, {}, std::move(resolvedCols), {}));
-    auto mergedUpdate = ComplexExpression("Update"_, {}, std::move(updateArgs), {});
- 
-    // re-register the merged Update's columns at seq 0 in the new columnEntries
-    // (all at the same seq since they are now a single compacted entry)
-    auto const& setArg = mergedUpdate.getArguments()[2];
-    if(auto const* setExpr = get_if<ComplexExpression>(&setArg)) {
-      for(size_t ci = 0; ci < setExpr->getArguments().size(); ci++) {
-        auto const& colArg = setExpr->getArguments()[ci];
-        if(auto const* colExpr = get_if<ComplexExpression>(&colArg)) {
-          auto& colEntries = bucket.columnEntries[colExpr->getHead().getName()];
 
-          if(colEntries.empty()) {
-            colEntries.reserve(WAL_COLUMN_ENTRY_RESERVE);
-          }
+  // V2H: rebuild compacted bucket as one column assignment per column.
+  // Do NOT build one merged Update here.
+  // Do NOT clone the merged Update back into every column.
+  for(auto& rc : resolved) {
+    auto const* colExpr = get_if<ComplexExpression>(&rc.expr);
+    if(!colExpr) continue;
 
-          bool blind = isBlindWrite(*colExpr);
-          colEntries.push_back({mergedUpdate.clone(), 0, blind});
-        }
-      }
+    std::string colName = colExpr->getHead().getName();
+
+    auto& colEntries = bucket.columnEntries[colName];
+
+    if(colEntries.empty()) {
+      colEntries.reserve(1);
     }
-    bucket.nextSeq = 1; // reset seq counter after compaction
+
+    bool blind = isBlindWrite(*colExpr);
+
+    // Keep latestSeq so flushBucket can emit columns in dependency-safe order.
+    colEntries.push_back({std::move(rc.expr), rc.latestSeq, blind});
   }
+
+  bucket.nextSeq = maxSeq + 1;
   // deleteEntry is preserved unchanged — caller decides what to emit
 }
 
@@ -1224,6 +1188,65 @@ static void optimiseBucketImpl(RowBucket& bucket) {
 //   }
 // }
 
+static std::optional<Expression> buildUpdateFromColumnEntries(
+  RowBucket& bucket,
+  std::vector<std::string> const& columns)
+{
+  if(!bucket.tableName.has_value() || !bucket.idExpr.has_value()) {
+    return std::nullopt;
+  }
+
+  struct OrderedCol {
+    int seq;
+    Expression expr;
+  };
+
+  std::vector<OrderedCol> orderedCols;
+
+  if(columns.empty()) {
+    // whole-row update: include all compacted columns
+    for(auto& [colName, entries] : bucket.columnEntries) {
+      if(entries.empty()) continue;
+      orderedCols.push_back({entries[0].seq, std::move(entries[0].expr)});
+    }
+  } else {
+    // selective update: include only requested columns
+    for(auto const& colName : columns) {
+      auto colIt = bucket.columnEntries.find(colName);
+      if(colIt == bucket.columnEntries.end()) continue;
+      if(colIt->second.empty()) continue;
+
+      orderedCols.push_back({colIt->second[0].seq, std::move(colIt->second[0].expr)});
+    }
+  }
+
+  if(orderedCols.empty()) {
+    return std::nullopt;
+  }
+
+  std::sort(
+    orderedCols.begin(),
+    orderedCols.end(),
+    [](OrderedCol const& a, OrderedCol const& b) {
+      return a.seq < b.seq;
+    }
+  );
+
+  boss::ExpressionArguments selectedCols;
+  selectedCols.reserve(orderedCols.size());
+
+  for(auto& col : orderedCols) {
+    selectedCols.push_back(std::move(col.expr));
+  }
+
+  boss::ExpressionArguments updateArgs;
+  updateArgs.push_back(bucket.tableName->clone());
+  updateArgs.push_back(bucket.idExpr->clone());
+  updateArgs.push_back(ComplexExpression("Set"_, {}, std::move(selectedCols), {}));
+
+  return ComplexExpression("Update"_, {}, std::move(updateArgs), {});
+}
+
 // ============================================================
 // flushBucket — optimise, collect, clear
 // ============================================================
@@ -1238,59 +1261,62 @@ static std::vector<Expression> flushBucket(
 
   RowBucket& bucket = it->second;
 
-  // count entries before any changes for walTotalEntries accounting
-  ssize_t countBefore = 0;
+  // If a row-level Delete is pending, a column-selective flush is not safe.
+  // A Delete affects the whole row, so force this to become a whole-row flush.
+  std::vector<std::string> effectiveColumns = columns;
+  if(bucket.deleteEntry.has_value()) {
+    effectiveColumns.clear();
+  }
 
-  auto flushingAllColumns = columns.empty();
+  bool flushingAllColumns = effectiveColumns.empty();
 
+  // Count the whole bucket before optimisation.
+  // This is needed for walTotalEntries accounting because optimiseBucketImpl()
+  // compacts the entire bucket, even during a selective flush.
+  size_t countBeforeAll = 0;
+  for(auto const& [col, entries] : bucket.columnEntries) {
+    countBeforeAll += entries.size();
+  }
+  if(bucket.deleteEntry.has_value()) {
+    countBeforeAll++;
+  }
+
+  // Count only the entries logically being flushed.
+  // This is used for instrumentation only.
+  size_t countBeforeFlushed = 0;
   if(flushingAllColumns) {
-    for(auto const& [col, entries] : bucket.columnEntries) {
-      countBefore += entries.size();
-    }
+    countBeforeFlushed = countBeforeAll;
   } else {
-    for(auto const& col : columns) {
-      auto it = bucket.columnEntries.find(col);
-      if(it != bucket.columnEntries.end()) {
-        countBefore += it->second.size();
+    for(auto const& col : effectiveColumns) {
+      auto colIt = bucket.columnEntries.find(col);
+      if(colIt != bucket.columnEntries.end()) {
+        countBeforeFlushed += colIt->second.size();
       }
     }
   }
 
-  // A delete invalidates the whole row, so count it whenever it is present.
-  // In practice, if there is a deleteEntry, the flush logic should treat the row
-  // as deleted rather than just flushing one column.
-  if(bucket.deleteEntry.has_value()) {
-    countBefore++;
-  }
+  recordFlushStart(reason, countBeforeFlushed);
 
-  recordFlushStart(reason, countBefore);
-
-  // compact the bucket in place
+  // Compact the bucket in place.
+  // Important: this compacts the whole bucket, not only selected columns.
   optimiseBucketImpl(bucket);
 
   std::vector<Expression> result;
 
-  if(columns.empty()) {
+  if(flushingAllColumns) {
     // ── whole-row flush ───────────────────────────────────────────────────
     // emit Delete first if one exists
     if(bucket.deleteEntry.has_value()) {
       result.push_back(bucket.deleteEntry->expr.clone());
     }
 
-    // emit the merged Update — after optimiseBucketImpl there is at most
-    // one entry per column, all sharing the same compacted Update expression
-    // grab from any column since they all point to the same merged Update
-    bool updateEmitted = false;
-    for(auto const& [col, entries] : bucket.columnEntries) {
-      if(!entries.empty() && !updateEmitted) {
-        result.push_back(entries[0].expr.clone());
-        updateEmitted = true;
-        break;
-      }
+    // V2H: build the final physical Update once from compacted column assignments.
+    if(auto update = buildUpdateFromColumnEntries(bucket, {})) {
+      result.push_back(std::move(*update));
     }
 
     // whole-row flush — remove the bucket entirely
-    walTotalEntries -= countBefore;
+    walTotalEntries -= countBeforeAll;
     walIndex.erase(it);
     walOrder.erase(std::remove(walOrder.begin(), walOrder.end(), key), walOrder.end());
 
@@ -1299,52 +1325,32 @@ static std::vector<Expression> flushBucket(
     // only emit and remove the requested columns
     // the remaining columns stay in the bucket for future reads
 
-    // collect the resolved expressions for the requested columns only
-    // and build a single merged Update containing just those columns
-    boss::ExpressionArguments selectedCols;
-    std::optional<Expression> savedTableName;
-    std::optional<Expression> savedIdExpr;
-    size_t removedEntries = 0;
+    // V2H: build final physical Update once from selected compacted columns.
+    if(auto update = buildUpdateFromColumnEntries(bucket, effectiveColumns)) {
+      result.push_back(std::move(*update));
+    }
 
-    for(auto const& colName : columns) {
+    // Now remove the selected columns from the bucket.
+    for(auto const& colName : effectiveColumns) {
       auto colIt = bucket.columnEntries.find(colName);
       if(colIt == bucket.columnEntries.end()) continue;
-      if(colIt->second.empty()) continue;
 
-      // after optimiseBucketImpl there is exactly one entry per column
-      // grab the column assignment from Set's first argument
-      auto const* entryExpr = get_if<ComplexExpression>(&colIt->second[0].expr);
-      if(!entryExpr || entryExpr->getArguments().size() < 3) continue;
-
-      // save table name and id from the first column we find
-      if(!savedTableName.has_value()) {
-        savedTableName = entryExpr->cloneArgument(0);
-        savedIdExpr    = entryExpr->cloneArgument(1);
-      }
-
-      // grab the column assignment from Set's first argument
-      auto const& setArg = entryExpr->getArguments()[2];
-      auto const* setExpr = get_if<ComplexExpression>(&setArg);
-      if(!setExpr || setExpr->getArguments().size() < 1) continue;
-
-      selectedCols.push_back(setExpr->cloneArgument(0));
-
-      // remove this column from the bucket — it is being flushed now
-      removedEntries += colIt->second.size();
       bucket.columnEntries.erase(colIt);
     }
 
-    // emit a merged Update with only the selected columns
-    if(!selectedCols.empty() && savedTableName.has_value()) {
-      boss::ExpressionArguments updateArgs;
-      updateArgs.push_back(std::move(*savedTableName));
-      updateArgs.push_back(std::move(*savedIdExpr));
-      updateArgs.push_back(ComplexExpression("Set"_, {}, std::move(selectedCols), {}));
-      result.push_back(ComplexExpression("Update"_, {}, std::move(updateArgs), {}));
+    // Recount the whole bucket after optimisation and selective removal.
+    // We must do this because optimiseBucketImpl() compacted the whole bucket,
+    // so subtracting only the removed selected entries is no longer correct.
+    size_t countAfterAll = 0;
+    for(auto const& [col, entries] : bucket.columnEntries) {
+      countAfterAll += entries.size();
+    }
+    if(bucket.deleteEntry.has_value()) {
+      countAfterAll++;
     }
 
-    // update walTotalEntries — only subtract what was actually removed
-    walTotalEntries -= removedEntries;
+    walTotalEntries -= countBeforeAll;
+    walTotalEntries += countAfterAll;
 
     // if all columns have been flushed, remove the bucket entirely
     // otherwise leave it alive for the remaining columns
