@@ -681,6 +681,88 @@ static Expression buildColumnExpression(WALEntry const& entry) {
   return ComplexExpression(entry.columnName, {}, std::move(colArgs), {});
 }
 
+static Expression foldColumnValues(Symbol const& colName,
+                                   Expression const& earlierValueExpr,
+                                   Expression const& laterValueExpr) {
+  // earlierValueExpr = Plus(price, 1)
+  // laterValueExpr   = Plus(price, 1)
+  //
+  // result:
+  // substitute price in laterValueExpr with earlierValueExpr
+  // => Plus(Plus(price, 1), 1)
+
+  size_t replacementCount = countSymbolOccurrences(laterValueExpr, colName);
+
+  Expression earlierValue = earlierValueExpr.clone();
+
+  bool canMoveEarlierValue = replacementCount == 1;
+  bool earlierValueMoved = false;
+
+  std::function<Expression(Expression const&)> substituteExpr;
+
+  auto substituteValue = [&](auto const& value) -> Expression {
+    using Decayed = std::decay_t<decltype(value)>;
+
+    if constexpr(std::is_same_v<Decayed, Symbol>) {
+      if(value == colName) {
+        if(canMoveEarlierValue && !earlierValueMoved) {
+          earlierValueMoved = true;
+          return std::move(earlierValue);
+        }
+
+        return earlierValue.clone();
+      }
+
+      return value;
+    } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
+      boss::ExpressionArguments newArgs;
+      auto const& args = value.getArguments();
+      newArgs.reserve(args.size());
+
+      for(auto const& arg : args) {
+        newArgs.push_back(std::visit(
+          [&](auto const& unwrapped) -> Expression {
+            using Inner = std::decay_t<decltype(unwrapped)>;
+
+            if constexpr(boss::utilities::isInstanceOfTemplate<
+                           Inner, boss::expressions::generic::MovableReferenceWrapper>::value) {
+              return substituteExpr(unwrapped.get());
+            } else {
+              return substituteExpr(unwrapped);
+            }
+          },
+          arg.getArgument()
+        ));
+      }
+
+      return ComplexExpression(value.getHead(), {}, std::move(newArgs), {});
+    } else if constexpr(std::is_same_v<Decayed, Expression>) {
+      return substituteExpr(value);
+    } else {
+      return value;
+    }
+  };
+
+  substituteExpr = [&](Expression const& expr) -> Expression {
+    return std::visit(
+      [&](auto const& value) -> Expression {
+        return substituteValue(value);
+      },
+      expr
+    );
+  };
+
+  Expression foldedValue = substituteExpr(laterValueExpr);
+
+  // attempt constant folding — simplifies same-operator chains
+  // e.g. Plus(Plus(price, 1), 1) → Plus(price, 2)
+  if(auto simplified = tryConstantFold(foldedValue)) {
+    foldedValue = std::move(*simplified);
+  }
+
+  return foldedValue;
+}
+
 // Fold two dependent writes on the same column into one composed expression
 // e.g. price(Plus(price, 1)) followed by price(Plus(price, 1))
 // becomes price(Plus(Plus(price, 1), 1))
@@ -911,45 +993,41 @@ static std::optional<Expression> resolveColumnEntries(
   int cutoffSeq)
 {
   std::optional<Expression> resolvedValue;
- 
-  // walk entry list backwards — latest entry first
+
   for(int idx = static_cast<int>(entries.size()) - 1; idx >= 0; idx--) {
     WALEntry const& walEntry = entries[idx];
- 
-    // only consider entries at or before cutoffSeq
+
     if(walEntry.seq > cutoffSeq) continue;
- 
-    // discard entries at or before the delete seq
-    if(bucket.deleteEntry.has_value() && walEntry.seq <= bucket.deleteEntry->seq) break;
- 
-    // V2H: each WAL entry now stores the column assignment directly,
-    // e.g. price(...), not Update(..., Set(price(...))).
-    Expression colAssignExpr = buildColumnExpression(walEntry);
 
-    auto const* colAssign = get_if<ComplexExpression>(&colAssignExpr);
-    if(!colAssign) continue;
+    if(bucket.deleteEntry.has_value() && walEntry.seq <= bucket.deleteEntry->seq) {
+      break;
+    }
 
- 
     if(!resolvedValue.has_value()) {
-      // first (latest) entry for this column
       if(walEntry.isBlindWrite) {
-        resolvedValue = colAssign->clone();
-        break; // Rule 1a: blind write, stop immediately
+        resolvedValue = walEntry.valueExpr.clone();
+        break;
       } else {
-        resolvedValue = colAssign->clone(); // Rule 1b: dependent, keep walking
+        resolvedValue = walEntry.valueExpr.clone();
       }
     } else {
-      auto const* resolvedExpr = get_if<ComplexExpression>(&*resolvedValue);
-      if(!resolvedExpr) break;
       if(walEntry.isBlindWrite) {
-        resolvedValue = foldColumnWrites(*colAssign, *resolvedExpr);
-        break; // blind base found, stop
+        resolvedValue = foldColumnValues(
+          walEntry.columnName,
+          walEntry.valueExpr,
+          *resolvedValue
+        );
+        break;
       } else {
-        resolvedValue = foldColumnWrites(*colAssign, *resolvedExpr);
+        resolvedValue = foldColumnValues(
+          walEntry.columnName,
+          walEntry.valueExpr,
+          *resolvedValue
+        );
       }
     }
   }
- 
+
   return resolvedValue;
 }
 
@@ -1041,8 +1119,9 @@ static void optimiseBucketImpl(RowBucket& bucket) {
   // we also track the seq of the latest surviving entry per column
   // so we can emit columns in correct seq order for cross-column dependencies
   struct ResolvedCol {
-    Expression expr;   // the resolved column assignment e.g. price(Plus(price,100))
-    int latestSeq;     // seq of the latest entry that contributed to this result
+    Symbol columnName;
+    Expression valueExpr;
+    int latestSeq;
   };
   std::vector<ResolvedCol> resolved;
  
@@ -1057,8 +1136,26 @@ static void optimiseBucketImpl(RowBucket& bucket) {
     // resolve this column's entries
     auto result = resolveColumnEntries(colName, entries, bucket, maxSeq);
     if(!result.has_value()) continue;
- 
-    resolved.push_back({std::move(*result), colLatestSeq});
+
+    // Find the Symbol for this column from the latest surviving entry.
+    // We need the Symbol because result is now only the RHS value expression,
+    // not the full column expression.
+    std::optional<Symbol> columnSymbol;
+
+    for(auto const& e : entries) {
+      if(e.seq == colLatestSeq) {
+        columnSymbol = e.columnName;
+        break;
+      }
+    }
+
+    if(!columnSymbol.has_value()) continue;
+
+    resolved.push_back({
+      *columnSymbol,
+      std::move(*result),
+      colLatestSeq
+    });
   }
  
   // sort resolved columns by latestSeq ascending
@@ -1075,35 +1172,25 @@ static void optimiseBucketImpl(RowBucket& bucket) {
   // clear the old column entries
   bucket.columnEntries.clear();
 
-  // V2H: rebuild compacted bucket as one column assignment per column.
-  // Do NOT build one merged Update here.
-  // Do NOT clone the merged Update back into every column.
+  // V2L: rebuild compacted bucket as one structured WAL entry per column.
+  // The resolved result is already the folded RHS value expression.
+  // Do not rebuild price(valueExpr) here.
   for(auto& rc : resolved) {
-    auto const* colExpr = get_if<ComplexExpression>(&rc.expr);
-    if(!colExpr) continue;
+    std::string colName = rc.columnName.getName();
 
-    std::string colName = colExpr->getHead().getName();
+    auto [colIt, colInserted] = bucket.columnEntries.try_emplace(colName);
+    auto& colEntries = colIt->second;
 
-    auto& colEntries = bucket.columnEntries[colName];
-
-    if(colEntries.empty()) {
+    if(colInserted) {
       colEntries.reserve(1);
     }
 
-    auto const& colArgs = colExpr->getArguments();
-
-    if(colArgs.empty()) {
-      continue;
-    }
-
-    Expression valueExpr = cloneWrappedArgument(colArgs[0]);
-
-    bool blind = isBlindValueWrite(valueExpr);
+    bool blind = isBlindValueWrite(rc.valueExpr);
 
     // Keep latestSeq so flushBucket can emit columns in dependency-safe order.
     colEntries.push_back({
-      colExpr->getHead(),
-      std::move(valueExpr),
+      rc.columnName,
+      std::move(rc.valueExpr),
       rc.latestSeq,
       blind
     });
