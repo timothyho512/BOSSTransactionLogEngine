@@ -725,7 +725,7 @@ static Expression foldColumnValues(Symbol const& colName,
             using Inner = std::decay_t<decltype(unwrapped)>;
 
             if constexpr(boss::utilities::isInstanceOfTemplate<
-                           Inner, boss::expressions::generic::MovableReferenceWrapper>::value) {
+                          Inner, boss::expressions::generic::MovableReferenceWrapper>::value) {
               return substituteExpr(unwrapped.get());
             } else {
               return substituteExpr(unwrapped);
@@ -735,7 +735,17 @@ static Expression foldColumnValues(Symbol const& colName,
         ));
       }
 
-      return ComplexExpression(value.getHead(), {}, std::move(newArgs), {});
+      Expression rebuilt =
+        ComplexExpression(value.getHead(), {}, std::move(newArgs), {});
+
+      // V2M: apply constant folding immediately during recursive substitution.
+      // This allows nested arithmetic chains introduced by substitution to be
+      // simplified before they become part of a larger expression tree.
+      if(auto simplified = tryConstantFold(rebuilt)) {
+        return std::move(*simplified);
+      }
+
+      return rebuilt;
     } else if constexpr(std::is_same_v<Decayed, Expression>) {
       return substituteExpr(value);
     } else {
