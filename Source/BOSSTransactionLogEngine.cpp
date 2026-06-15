@@ -72,9 +72,15 @@ struct WALKeyHash {
 
 // One WAL entry: the raw expression and its global arrival sequence number
 struct WALEntry {
+  Symbol columnName;
+  Expression valueExpr;
+  int seq;
+  bool isBlindWrite = false;
+};
+
+struct DeleteEntry {
   Expression expr;
   int seq;
-  bool isBlindWrite = false; // true if this entry is a blind write (no Symbol dependencies)
 };
 
 // SelectTarget — result of parsing a Select or Project(Select(...)) expression
@@ -93,7 +99,7 @@ struct RowBucket {
   std::unordered_map<std::string, std::vector<WALEntry>> columnEntries;
 
   // latest Delete for this row
-  std::optional<WALEntry> deleteEntry;
+  std::optional<DeleteEntry> deleteEntry;
 
   // table and row id are the same for every entry in this row bucket
   // so store them once instead of cloning them into every column entry
@@ -427,6 +433,10 @@ static bool containsSymbol(Expression const& expr) {
   );
 }
 
+static bool isBlindValueWrite(Expression const& valueExpr) {
+  return !containsSymbol(valueExpr);
+}
+
 // Check if a column assignment in Set(...) is a blind write
 // e.g. price(100.0) → blind write, price(Plus(price, 1)) → dependent write
 static bool isBlindWrite(ComplexExpression const& colAssign) {
@@ -664,6 +674,13 @@ static size_t countSymbolOccurrences(Expression const& expr, Symbol const& targe
   );
 }
 
+static Expression buildColumnExpression(WALEntry const& entry) {
+  boss::ExpressionArguments colArgs;
+  colArgs.push_back(entry.valueExpr.clone());
+
+  return ComplexExpression(entry.columnName, {}, std::move(colArgs), {});
+}
+
 // Fold two dependent writes on the same column into one composed expression
 // e.g. price(Plus(price, 1)) followed by price(Plus(price, 1))
 // becomes price(Plus(Plus(price, 1), 1))
@@ -821,6 +838,12 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
           if(auto const* colExpr = get_if<ComplexExpression>(&colArg)) {
             std::string colName = colExpr->getHead().getName();
 
+            auto const& colArgs = colExpr->getArguments();
+
+            if(colArgs.empty()) {
+              continue;
+            }
+
             int seq = bucket.nextSeq++;
 
             auto [colIt, colInserted] = bucket.columnEntries.try_emplace(colName);
@@ -830,8 +853,16 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
               colEntries.reserve(WAL_COLUMN_ENTRY_RESERVE);
             }
 
-            bool blind = isBlindWrite(*colExpr);
-            colEntries.push_back({colExpr->clone(), seq, blind});
+            Expression valueExpr = cloneWrappedArgument(colArgs[0]);
+
+            bool blind = isBlindValueWrite(valueExpr);
+
+            colEntries.push_back({
+              colExpr->getHead(),
+              std::move(valueExpr),
+              seq,
+              blind
+            });
             walTotalEntries++; // once per column, not once per Update
             #if BOSS_WAL_INSTRUMENTATION
             walStats.walEntriesCreated++;
@@ -844,7 +875,7 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
       // but Delete is captured independently so seq reflects actual arrival order
       int seq = bucket.nextSeq++;
       if(!bucket.deleteEntry.has_value() || seq > bucket.deleteEntry->seq) {
-        bucket.deleteEntry = {walEntry.clone(), seq, false};
+        bucket.deleteEntry = DeleteEntry{walEntry.clone(), seq};
       }
       walTotalEntries++;
       #if BOSS_WAL_INSTRUMENTATION
@@ -893,7 +924,9 @@ static std::optional<Expression> resolveColumnEntries(
  
     // V2H: each WAL entry now stores the column assignment directly,
     // e.g. price(...), not Update(..., Set(price(...))).
-    auto const* colAssign = get_if<ComplexExpression>(&walEntry.expr);
+    Expression colAssignExpr = buildColumnExpression(walEntry);
+
+    auto const* colAssign = get_if<ComplexExpression>(&colAssignExpr);
     if(!colAssign) continue;
 
  
@@ -1057,10 +1090,23 @@ static void optimiseBucketImpl(RowBucket& bucket) {
       colEntries.reserve(1);
     }
 
-    bool blind = isBlindWrite(*colExpr);
+    auto const& colArgs = colExpr->getArguments();
+
+    if(colArgs.empty()) {
+      continue;
+    }
+
+    Expression valueExpr = cloneWrappedArgument(colArgs[0]);
+
+    bool blind = isBlindValueWrite(valueExpr);
 
     // Keep latestSeq so flushBucket can emit columns in dependency-safe order.
-    colEntries.push_back({std::move(rc.expr), rc.latestSeq, blind});
+    colEntries.push_back({
+      colExpr->getHead(),
+      std::move(valueExpr),
+      rc.latestSeq,
+      blind
+    });
   }
 
   bucket.nextSeq = maxSeq + 1;
@@ -1206,7 +1252,7 @@ static std::optional<Expression> buildUpdateFromColumnEntries(
     // whole-row update: include all compacted columns
     for(auto& [colName, entries] : bucket.columnEntries) {
       if(entries.empty()) continue;
-      orderedCols.push_back({entries[0].seq, std::move(entries[0].expr)});
+      orderedCols.push_back({entries[0].seq, buildColumnExpression(entries[0])});
     }
   } else {
     // selective update: include only requested columns
@@ -1215,7 +1261,7 @@ static std::optional<Expression> buildUpdateFromColumnEntries(
       if(colIt == bucket.columnEntries.end()) continue;
       if(colIt->second.empty()) continue;
 
-      orderedCols.push_back({colIt->second[0].seq, std::move(colIt->second[0].expr)});
+      orderedCols.push_back({colIt->second[0].seq, buildColumnExpression(colIt->second[0])});
     }
   }
 
@@ -1836,7 +1882,7 @@ static Expression evaluate(Expression &&e) {
             std::vector<std::pair<int, Expression>> allEntries;
             for(auto const& [col, colEntries] : bucket.columnEntries) {
               for(auto const& e : colEntries)
-                allEntries.push_back({e.seq, e.expr.clone()});
+                allEntries.push_back({e.seq, buildColumnExpression(e)});
             }
             if(bucket.deleteEntry.has_value())
               allEntries.push_back({bucket.deleteEntry->seq, bucket.deleteEntry->expr.clone()});
