@@ -4,6 +4,7 @@
 #include <Utilities.hpp>
 #include <iostream>
 #include <vector>
+#include <list>
 #include <unordered_map>
 #include <optional>
 #include <algorithm>
@@ -108,13 +109,17 @@ struct RowBucket {
 
   // monotonically increasing counter across columns
   int nextSeq = 0;
+
+  // iterator into walOrder for O(1) removal on flush
+  std::list<WALKey>::iterator orderIter;
 };
  
 // the WAL index: (tableName, rowID) → bucket
 static std::unordered_map<WALKey, RowBucket, WALKeyHash> walIndex;
  
 // insertion order of keys — so flush emits entries in the order rows were first touched
-static std::vector<WALKey> walOrder;
+// std::list gives stable iterators — each RowBucket stores its own iterator for O(1) removal
+static std::list<WALKey> walOrder;
  
 // total number of entries across all buckets — for threshold check
 static size_t walTotalEntries = 0;
@@ -905,6 +910,7 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
 
   if(inserted) {
     walOrder.push_back(key);
+    bucketIt->second.orderIter = std::prev(walOrder.end());
   }
 
   RowBucket& bucket = bucketIt->second;
@@ -1459,8 +1465,8 @@ static std::vector<Expression> flushBucket(
 
     // whole-row flush — remove the bucket entirely
     walTotalEntries -= countBeforeAll;
+    walOrder.erase(it->second.orderIter);
     walIndex.erase(it);
-    walOrder.erase(std::remove(walOrder.begin(), walOrder.end(), key), walOrder.end());
 
   } else {
     // ── column-selective flush ────────────────────────────────────────────
@@ -1497,8 +1503,8 @@ static std::vector<Expression> flushBucket(
     // if all columns have been flushed, remove the bucket entirely
     // otherwise leave it alive for the remaining columns
     if(bucket.columnEntries.empty() && !bucket.deleteEntry.has_value()) {
+      walOrder.erase(it->second.orderIter);
       walIndex.erase(it);
-      walOrder.erase(std::remove(walOrder.begin(), walOrder.end(), key), walOrder.end());
     }
   }
 
