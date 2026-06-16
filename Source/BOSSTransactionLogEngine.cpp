@@ -686,6 +686,76 @@ static Expression buildColumnExpression(WALEntry const& entry) {
   return ComplexExpression(entry.columnName, {}, std::move(colArgs), {});
 }
 
+// ============================================================
+// substituteAndFold — recursive substitution without std::function overhead
+// ============================================================
+//
+// Replaces all occurrences of colName with replacement inside expr,
+// applying tryConstantFold after rebuilding each ComplexExpression node (V2M).
+//
+// V2O: foldColumnValues previously used a std::function<Expression(Expression
+// const&)> for mutual recursion between two lambdas (substituteExpr and
+// substituteValue). std::function uses type erasure, so every recursive call
+// went through virtual dispatch, plus each argument passed to it was
+// implicitly converted into a temporary Expression (a clone for
+// ComplexExpression). Replacing it with two ordinary mutually recursive
+// functions removes both the dispatch overhead and the implicit clones —
+// visitArgumentByReference already gives us the concrete unwrapped type, so
+// substituteAndFoldValue can dispatch on it directly via if constexpr.
+
+static Expression substituteAndFold(Expression const& expr,
+                                    Symbol const& colName,
+                                    Expression& replacement,
+                                    bool canMove,
+                                    bool& moved);
+
+template <typename T>
+static Expression substituteAndFoldValue(T const& value,
+                                          Symbol const& colName,
+                                          Expression& replacement,
+                                          bool canMove,
+                                          bool& moved)
+{
+  using Decayed = std::decay_t<T>;
+
+  if constexpr(std::is_same_v<Decayed, Symbol>) {
+    if(value == colName) {
+      if(canMove && !moved) { moved = true; return std::move(replacement); }
+      return replacement.clone();
+    }
+    return value;
+  } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
+    boss::ExpressionArguments newArgs;
+    auto const& args = value.getArguments();
+    newArgs.reserve(args.size());
+    for(auto const& arg : args) {
+      newArgs.push_back(visitArgumentByReference(arg, [&](auto const& inner) -> Expression {
+        return substituteAndFoldValue(inner, colName, replacement, canMove, moved);
+      }));
+    }
+    Expression rebuilt = ComplexExpression(value.getHead(), {}, std::move(newArgs), {});
+
+    // V2M: apply constant folding immediately during recursive substitution.
+    if(auto simplified = tryConstantFold(rebuilt)) return std::move(*simplified);
+    return rebuilt;
+  } else if constexpr(std::is_same_v<Decayed, Expression>) {
+    return substituteAndFold(value, colName, replacement, canMove, moved);
+  } else {
+    return value;
+  }
+}
+
+static Expression substituteAndFold(Expression const& expr,
+                                    Symbol const& colName,
+                                    Expression& replacement,
+                                    bool canMove,
+                                    bool& moved)
+{
+  return std::visit([&](auto const& value) -> Expression {
+    return substituteAndFoldValue(value, colName, replacement, canMove, moved);
+  }, expr);
+}
+
 static Expression foldColumnValues(Symbol const& colName,
                                    Expression const& earlierValueExpr,
                                    Expression const& laterValueExpr) {
@@ -703,76 +773,12 @@ static Expression foldColumnValues(Symbol const& colName,
   bool canMoveEarlierValue = replacementCount == 1;
   bool earlierValueMoved = false;
 
-  std::function<Expression(Expression const&)> substituteExpr;
+  Expression foldedValue = substituteAndFold(
+    laterValueExpr, colName, earlierValue, canMoveEarlierValue, earlierValueMoved);
 
-  auto substituteValue = [&](auto const& value) -> Expression {
-    using Decayed = std::decay_t<decltype(value)>;
-
-    if constexpr(std::is_same_v<Decayed, Symbol>) {
-      if(value == colName) {
-        if(canMoveEarlierValue && !earlierValueMoved) {
-          earlierValueMoved = true;
-          return std::move(earlierValue);
-        }
-
-        return earlierValue.clone();
-      }
-
-      return value;
-    } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
-      boss::ExpressionArguments newArgs;
-      auto const& args = value.getArguments();
-      newArgs.reserve(args.size());
-
-      for(auto const& arg : args) {
-        newArgs.push_back(std::visit(
-          [&](auto const& unwrapped) -> Expression {
-            using Inner = std::decay_t<decltype(unwrapped)>;
-
-            if constexpr(boss::utilities::isInstanceOfTemplate<
-                          Inner, boss::expressions::generic::MovableReferenceWrapper>::value) {
-              return substituteExpr(unwrapped.get());
-            } else {
-              return substituteExpr(unwrapped);
-            }
-          },
-          arg.getArgument()
-        ));
-      }
-
-      Expression rebuilt =
-        ComplexExpression(value.getHead(), {}, std::move(newArgs), {});
-
-      // V2M: apply constant folding immediately during recursive substitution.
-      // This allows nested arithmetic chains introduced by substitution to be
-      // simplified before they become part of a larger expression tree.
-      if(auto simplified = tryConstantFold(rebuilt)) {
-        return std::move(*simplified);
-      }
-
-      return rebuilt;
-    } else if constexpr(std::is_same_v<Decayed, Expression>) {
-      return substituteExpr(value);
-    } else {
-      return value;
-    }
-  };
-
-  substituteExpr = [&](Expression const& expr) -> Expression {
-    return std::visit(
-      [&](auto const& value) -> Expression {
-        return substituteValue(value);
-      },
-      expr
-    );
-  };
-
-  Expression foldedValue = substituteExpr(laterValueExpr);
-
-  // attempt constant folding — simplifies same-operator chains
-  // e.g. Plus(Plus(price, 1), 1) → Plus(price, 2)
+  // top-level constant fold (inner nodes already folded by substituteAndFoldValue)
   if(auto simplified = tryConstantFold(foldedValue)) {
-    foldedValue = std::move(*simplified);
+    return std::move(*simplified);
   }
 
   return foldedValue;
