@@ -921,32 +921,38 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
 
   RowBucket& bucket = bucketIt->second;
 
-  if(auto const* entry = get_if<ComplexExpression>(&walEntry)) {
+  if(auto* entry = get_if<ComplexExpression>(&walEntry)) {
     if(entry->getHead() == "Update"_ && entry->getArguments().size() >= 3) {
-      // grab table name and id expression — shared across all columns in this Update
-      // we need these to reconstruct a per-column Update expression for each column
-      auto const& tableArg = entry->getArguments()[0]; // e.g. Symbol "Customer"
-      auto const& idArg    = entry->getArguments()[1]; // e.g. id(List(5))
+      // V2Q: decompose the incoming Update expression so we can move its
+      // sub-expressions directly into WALEntries instead of cloning them.
+      auto [updateHead, updateStatics, updateDynamics, updateSpans] =
+        std::move(*entry).decompose();
 
-      auto const& setArg = entry->getArguments()[2];
-      if(auto const* setExpr = get_if<ComplexExpression>(&setArg)) {
-        if(!bucket.tableName.has_value()) {
-          bucket.tableName = cloneWrappedArgument(tableArg);
-          bucket.idExpr    = cloneWrappedArgument(idArg);
-        }
+      if(!bucket.tableName.has_value()) {
+        bucket.tableName = std::move(updateDynamics[0]);
+        bucket.idExpr    = std::move(updateDynamics[1]);
+      }
+
+      Expression setExpression = std::move(updateDynamics[2]);
+      if(auto* setExpr = get_if<ComplexExpression>(&setExpression)) {
         // iterate columns in Set(...) in order — order matters for cross-column dependencies
         // e.g. Set(price(100), total(Times(price, 2))) — price must come before total
         // we assign a fresh seq to each column so they sort correctly at flush time
-        for(size_t ci = 0; ci < setExpr->getArguments().size(); ci++) {
-          auto const& colArg = setExpr->getArguments()[ci];
-          if(auto const* colExpr = get_if<ComplexExpression>(&colArg)) {
-            std::string colName = colExpr->getHead().getName();
+        auto [setHead, setStatics, setDynamics, setSpans] = std::move(*setExpr).decompose();
 
-            auto const& colArgs = colExpr->getArguments();
+        for(size_t ci = 0; ci < setDynamics.size(); ci++) {
+          Expression colExpression = std::move(setDynamics[ci]);
+          if(auto* colPtr = get_if<ComplexExpression>(&colExpression)) {
+            auto [colHead, colStatics, colDynamics, colSpans] = std::move(*colPtr).decompose();
 
-            if(colArgs.empty()) {
+            if(colDynamics.empty()) {
               continue;
             }
+
+            std::string colName = colHead.getName();
+            Expression valueExpr = std::move(colDynamics[0]);
+
+            bool blind = isBlindValueWrite(valueExpr);
 
             int seq = bucket.nextSeq++;
 
@@ -957,12 +963,8 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
               colEntries.reserve(WAL_COLUMN_ENTRY_RESERVE);
             }
 
-            Expression valueExpr = cloneWrappedArgument(colArgs[0]);
-
-            bool blind = isBlindValueWrite(valueExpr);
-
             colEntries.push_back({
-              colExpr->getHead(),
+              std::move(colHead),
               std::move(valueExpr),
               seq,
               blind
@@ -979,7 +981,7 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
       // but Delete is captured independently so seq reflects actual arrival order
       int seq = bucket.nextSeq++;
       if(!bucket.deleteEntry.has_value() || seq > bucket.deleteEntry->seq) {
-        bucket.deleteEntry = DeleteEntry{walEntry.clone(), seq};
+        bucket.deleteEntry = DeleteEntry{std::move(walEntry), seq};
       }
       walTotalEntries++;
       #if BOSS_WAL_INSTRUMENTATION
@@ -1473,7 +1475,7 @@ static std::vector<Expression> flushBucket(
     // ── whole-row flush ───────────────────────────────────────────────────
     // emit Delete first if one exists
     if(bucket.deleteEntry.has_value()) {
-      result.push_back(bucket.deleteEntry->expr.clone());
+      result.push_back(std::move(bucket.deleteEntry->expr));
     }
 
     // V2P: build the final physical Update directly from the resolved
