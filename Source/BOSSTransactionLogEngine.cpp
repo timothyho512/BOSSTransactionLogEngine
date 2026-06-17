@@ -1107,26 +1107,34 @@ static void collectSymbolNamesValue(T const& value, std::vector<std::string>& na
 }
 
 // ============================================================
-// optimiseBucketImpl — compact bucket in place
+// ResolvedCol / resolveBucketColumns — read-only column resolution
 // ============================================================
 //
-// Resolves each column's entry list into a single final expression.
-// Handles:
-//   Rule 1a: blind write — last-write-wins, discard earlier entries
-//   Rule 1b: same-column dependent write — fold chain backwards
-//   Rule 1c: cross-column dependency — when column X at seq s depends on
-//            Symbol Y (different column), resolve Y's entries up to seq s-1
-//            and emit Y before X in the merged Set(...)
-//   Rule 2:  Delete — discard all entries before deleteEntry.seq
-//   Rule 3:  merge columns — all surviving columns in one Update (implicit)
+// Resolves each column's entry list into a single final expression, sorted
+// by latestSeq ascending (the order columns were last written — needed so
+// cross-column dependencies are emitted correctly: if price was written
+// before total, price must appear before total in Set(...)).
 //
-// After this call the bucket's columnEntries are replaced with at most
-// one entry per column (the resolved result), and deleteEntry is preserved.
- 
-static void optimiseBucketImpl(RowBucket& bucket) {
+// V2P: this is the resolution half of what optimiseBucketImpl used to do,
+// pulled out so callers that are about to consume the result directly
+// (flushBucket) don't have to round-trip it through bucket.columnEntries
+// first. Does NOT mutate the bucket — see optimiseBucketImpl below for the
+// "resolve and persist back into columnEntries" version.
+struct ResolvedCol {
+  Symbol columnName;
+  Expression valueExpr;
+  int latestSeq;
+};
+
+struct BucketResolution {
+  std::vector<ResolvedCol> columns; // sorted by latestSeq ascending
+  int maxSeq;
+};
+
+static BucketResolution resolveBucketColumns(RowBucket const& bucket) {
   // deleteSeq: entries at or before this seq are discarded
   int deleteSeq = bucket.deleteEntry.has_value() ? bucket.deleteEntry->seq : -1;
- 
+
   // find the maximum seq across all surviving entries — used as cutoff for resolution
   // "surviving" means seq > deleteSeq
   int maxSeq = deleteSeq; // start at deleteSeq, will be updated as we find surviving entries
@@ -1135,18 +1143,9 @@ static void optimiseBucketImpl(RowBucket& bucket) {
       if(e.seq > deleteSeq && e.seq > maxSeq) maxSeq = e.seq;
     }
   }
- 
-  // resolve each column using all its entries up to maxSeq
-  // result: map from column name to resolved expression
-  // we also track the seq of the latest surviving entry per column
-  // so we can emit columns in correct seq order for cross-column dependencies
-  struct ResolvedCol {
-    Symbol columnName;
-    Expression valueExpr;
-    int latestSeq;
-  };
+
   std::vector<ResolvedCol> resolved;
- 
+
   for(auto const& [colName, entries] : bucket.columnEntries) {
     // find the latest surviving entry seq for this column
     int colLatestSeq = -1;
@@ -1154,7 +1153,7 @@ static void optimiseBucketImpl(RowBucket& bucket) {
       if(e.seq > deleteSeq && e.seq > colLatestSeq) colLatestSeq = e.seq;
     }
     if(colLatestSeq == -1) continue; // all entries before delete, skip
- 
+
     // resolve this column's entries
     auto result = resolveColumnEntries(colName, entries, bucket, maxSeq);
     if(!result.has_value()) continue;
@@ -1179,25 +1178,47 @@ static void optimiseBucketImpl(RowBucket& bucket) {
       colLatestSeq
     });
   }
- 
+
   // sort resolved columns by latestSeq ascending
-  // this ensures columns are emitted in the order they were last written
-  // which is critical for cross-column dependencies:
-  // if price was written before total, price must appear before total in Set(...)
-  // so the in-memory engine evaluates price first, then total reads the updated price
   std::sort(resolved.begin(), resolved.end(),
     [](ResolvedCol const& a, ResolvedCol const& b) {
       return a.latestSeq < b.latestSeq;
     });
- 
-  // clear the old column entries
+
+  return { std::move(resolved), maxSeq };
+}
+
+// ============================================================
+// optimiseBucketImpl — compact bucket in place
+// ============================================================
+//
+// Resolves each column's entry list into a single final expression and
+// persists that compacted state back into bucket.columnEntries. Handles:
+//   Rule 1a: blind write — last-write-wins, discard earlier entries
+//   Rule 1b: same-column dependent write — fold chain backwards
+//   Rule 1c: cross-column dependency — when column X at seq s depends on
+//            Symbol Y (different column), resolve Y's entries up to seq s-1
+//            and emit Y before X in the merged Set(...)
+//   Rule 2:  Delete — discard all entries before deleteEntry.seq
+//   Rule 3:  merge columns — all surviving columns in one Update (implicit)
+//
+// After this call the bucket's columnEntries are replaced with at most
+// one entry per column (the resolved result), and deleteEntry is preserved.
+//
+// Used by the standalone OptimiseWAL command, and by flushBucket's
+// column-selective path for the columns that must survive the flush.
+// flushBucket's whole-row path does NOT call this — see resolveBucketColumns
+// above and the V2P comment in flushBucket for why.
+static void optimiseBucketImpl(RowBucket& bucket) {
+  auto resolution = resolveBucketColumns(bucket);
+
   // clear the old column entries
   bucket.columnEntries.clear();
 
   // V2L: rebuild compacted bucket as one structured WAL entry per column.
   // The resolved result is already the folded RHS value expression.
   // Do not rebuild price(valueExpr) here.
-  for(auto& rc : resolved) {
+  for(auto& rc : resolution.columns) {
     std::string colName = rc.columnName.getName();
 
     auto [colIt, colInserted] = bucket.columnEntries.try_emplace(colName);
@@ -1218,7 +1239,7 @@ static void optimiseBucketImpl(RowBucket& bucket) {
     });
   }
 
-  bucket.nextSeq = maxSeq + 1;
+  bucket.nextSeq = resolution.maxSeq + 1;
   // deleteEntry is preserved unchanged — caller decides what to emit
 }
 
@@ -1342,55 +1363,39 @@ static void optimiseBucketImpl(RowBucket& bucket) {
 //   }
 // }
 
-static std::optional<Expression> buildUpdateFromColumnEntries(
-  RowBucket& bucket,
-  std::vector<std::string> const& columns)
+// ============================================================
+// buildUpdateFromResolvedColumns — assemble Update(...) directly from
+// already-resolved columns, without touching bucket.columnEntries
+// ============================================================
+//
+// V2P: takes a vector of ResolvedCol (from resolveBucketColumns) instead of
+// reading bucket.columnEntries. The caller decides which resolved columns
+// to pass in — typically the ones being flushed right now, which would
+// otherwise be written into columnEntries only to be read back out once
+// here and then discarded/erased.
+//
+// selected is already sorted by latestSeq ascending (resolveBucketColumns
+// guarantees this, and partitioning it preserves relative order), so no
+// re-sort is needed here.
+static std::optional<Expression> buildUpdateFromResolvedColumns(
+  RowBucket const& bucket,
+  std::vector<ResolvedCol>& selected)
 {
   if(!bucket.tableName.has_value() || !bucket.idExpr.has_value()) {
     return std::nullopt;
   }
 
-  struct OrderedCol {
-    int seq;
-    Expression expr;
-  };
-
-  std::vector<OrderedCol> orderedCols;
-
-  if(columns.empty()) {
-    // whole-row update: include all compacted columns
-    for(auto& [colName, entries] : bucket.columnEntries) {
-      if(entries.empty()) continue;
-      orderedCols.push_back({entries[0].seq, buildColumnExpression(entries[0])});
-    }
-  } else {
-    // selective update: include only requested columns
-    for(auto const& colName : columns) {
-      auto colIt = bucket.columnEntries.find(colName);
-      if(colIt == bucket.columnEntries.end()) continue;
-      if(colIt->second.empty()) continue;
-
-      orderedCols.push_back({colIt->second[0].seq, buildColumnExpression(colIt->second[0])});
-    }
-  }
-
-  if(orderedCols.empty()) {
+  if(selected.empty()) {
     return std::nullopt;
   }
 
-  std::sort(
-    orderedCols.begin(),
-    orderedCols.end(),
-    [](OrderedCol const& a, OrderedCol const& b) {
-      return a.seq < b.seq;
-    }
-  );
-
   boss::ExpressionArguments selectedCols;
-  selectedCols.reserve(orderedCols.size());
+  selectedCols.reserve(selected.size());
 
-  for(auto& col : orderedCols) {
-    selectedCols.push_back(std::move(col.expr));
+  for(auto& rc : selected) {
+    boss::ExpressionArguments colArgs;
+    colArgs.push_back(std::move(rc.valueExpr));
+    selectedCols.push_back(ComplexExpression(rc.columnName, {}, std::move(colArgs), {}));
   }
 
   boss::ExpressionArguments updateArgs;
@@ -1424,9 +1429,9 @@ static std::vector<Expression> flushBucket(
 
   bool flushingAllColumns = effectiveColumns.empty();
 
-  // Count the whole bucket before optimisation.
-  // This is needed for walTotalEntries accounting because optimiseBucketImpl()
-  // compacts the entire bucket, even during a selective flush.
+  // Count the whole bucket before resolution.
+  // This is needed for walTotalEntries accounting because resolveBucketColumns()
+  // resolves the entire bucket, even during a selective flush.
   size_t countBeforeAll = 0;
   for(auto const& [col, entries] : bucket.columnEntries) {
     countBeforeAll += entries.size();
@@ -1451,9 +1456,16 @@ static std::vector<Expression> flushBucket(
 
   recordFlushStart(reason, countBeforeFlushed);
 
-  // Compact the bucket in place.
-  // Important: this compacts the whole bucket, not only selected columns.
-  optimiseBucketImpl(bucket);
+  // V2P: resolve all columns once, without writing the result back into
+  // bucket.columnEntries yet. Previously optimiseBucketImpl() wrote every
+  // resolved column into the map unconditionally, even though:
+  //   - in a whole-row flush, the entire bucket (map included) is destroyed
+  //     a few lines later — so the rewrite was read once then thrown away
+  //   - in a column-selective flush, the columns being flushed right now
+  //     are written into the map only to be read back out and erased again
+  // Only columns that need to remain in the bucket afterward are persisted
+  // below; columns being flushed now go straight from resolution to output.
+  auto resolution = resolveBucketColumns(bucket);
 
   std::vector<Expression> result;
 
@@ -1464,44 +1476,74 @@ static std::vector<Expression> flushBucket(
       result.push_back(bucket.deleteEntry->expr.clone());
     }
 
-    // V2H: build the final physical Update once from compacted column assignments.
-    if(auto update = buildUpdateFromColumnEntries(bucket, {})) {
+    // V2P: build the final physical Update directly from the resolved
+    // columns — every column is being flushed, so none need to be written
+    // into bucket.columnEntries before the bucket is erased below.
+    if(auto update = buildUpdateFromResolvedColumns(bucket, resolution.columns)) {
       result.push_back(std::move(*update));
     }
 
-    // whole-row flush — remove the bucket entirely
+    // whole-row flush — the bucket (and its columnEntries map) is about to
+    // be destroyed entirely, so there is nothing left to persist.
     walTotalEntries -= countBeforeAll;
     walOrder.erase(it->second.orderIter);
     walIndex.erase(it);
 
   } else {
     // ── column-selective flush ────────────────────────────────────────────
-    // only emit and remove the requested columns
-    // the remaining columns stay in the bucket for future reads
+    // only emit the requested columns; the remaining columns stay in the
+    // bucket for future reads, so only those need to be persisted back.
 
-    // V2H: build final physical Update once from selected compacted columns.
-    if(auto update = buildUpdateFromColumnEntries(bucket, effectiveColumns)) {
+    // Partition the resolved columns into "being flushed now" (selected)
+    // and "must survive in the bucket" (surviving). Both vectors preserve
+    // resolveBucketColumns()'s latestSeq-ascending order.
+    std::vector<ResolvedCol> selected;
+    std::vector<ResolvedCol> surviving;
+
+    for(auto& rc : resolution.columns) {
+      bool isSelected = std::find(effectiveColumns.begin(), effectiveColumns.end(),
+                                   rc.columnName.getName()) != effectiveColumns.end();
+      if(isSelected) {
+        selected.push_back(std::move(rc));
+      } else {
+        surviving.push_back(std::move(rc));
+      }
+    }
+
+    // V2P: build the final physical Update directly from the selected
+    // columns, without ever writing them into bucket.columnEntries.
+    if(auto update = buildUpdateFromResolvedColumns(bucket, selected)) {
       result.push_back(std::move(*update));
     }
 
-    // Now remove the selected columns from the bucket.
-    for(auto const& colName : effectiveColumns) {
-      auto colIt = bucket.columnEntries.find(colName);
-      if(colIt == bucket.columnEntries.end()) continue;
+    // Persist only the surviving columns. The old (pre-resolution) entries
+    // for every column — including the ones just flushed — are discarded
+    // here; the flushed ones don't need to be written back at all.
+    bucket.columnEntries.clear();
+    for(auto& rc : surviving) {
+      std::string colName = rc.columnName.getName();
 
-      bucket.columnEntries.erase(colIt);
-    }
+      auto [colIt, colInserted] = bucket.columnEntries.try_emplace(colName);
+      auto& colEntries = colIt->second;
 
-    // Recount the whole bucket after optimisation and selective removal.
-    // We must do this because optimiseBucketImpl() compacted the whole bucket,
-    // so subtracting only the removed selected entries is no longer correct.
-    size_t countAfterAll = 0;
-    for(auto const& [col, entries] : bucket.columnEntries) {
-      countAfterAll += entries.size();
+      if(colInserted) {
+        colEntries.reserve(1);
+      }
+
+      bool blind = isBlindValueWrite(rc.valueExpr);
+
+      colEntries.push_back({
+        rc.columnName,
+        std::move(rc.valueExpr),
+        rc.latestSeq,
+        blind
+      });
     }
-    if(bucket.deleteEntry.has_value()) {
-      countAfterAll++;
-    }
+    bucket.nextSeq = resolution.maxSeq + 1;
+
+    // deleteEntry is guaranteed absent here (forced to flushingAllColumns
+    // above otherwise), so countAfterAll is simply the surviving count.
+    size_t countAfterAll = surviving.size();
 
     walTotalEntries -= countBeforeAll;
     walTotalEntries += countAfterAll;
