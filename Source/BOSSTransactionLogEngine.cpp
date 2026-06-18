@@ -60,16 +60,34 @@ static int64_t toInt64(RowID const& id) {
   return std::visit([](auto const& v) { return static_cast<int64_t>(v); }, id);
 }
  
-using WALKey = std::pair<std::string, int64_t>; // (tableName, rowID)
- 
+using WALKey = std::pair<int32_t, int64_t>; // (tableId, rowID)
+
 struct WALKeyHash {
   size_t operator()(WALKey const& k) const {
-    size_t h1 = std::hash<std::string>{}(k.first);
+    size_t h1 = std::hash<int32_t>{}(k.first);
     size_t h2 = std::hash<int64_t>{}(k.second);
-    // combine the two hashes — shift h2 to avoid trivial cancellation
     return h1 ^ (h2 * 2654435761ULL);
   }
 };
+
+// Intern tables — convert low-cardinality string keys (table names, column names)
+// to small integers so WAL index and column entry map lookups hash integers, not strings.
+static std::unordered_map<std::string, int32_t> tableNameIntern;
+static std::unordered_map<std::string, int32_t> columnNameIntern;
+static int32_t nextTableId = 0;
+static int32_t nextColumnId = 0;
+
+static int32_t internTableName(std::string const& name) {
+  auto [it, inserted] = tableNameIntern.try_emplace(name, nextTableId);
+  if(inserted) ++nextTableId;
+  return it->second;
+}
+
+static int32_t internColumnName(std::string const& name) {
+  auto [it, inserted] = columnNameIntern.try_emplace(name, nextColumnId);
+  if(inserted) ++nextColumnId;
+  return it->second;
+}
 
 // One WAL entry: the raw expression and its global arrival sequence number
 struct WALEntry {
@@ -97,7 +115,7 @@ struct RowBucket {
   // per-column entry lists
   // Before V2H, each WALEntry stored a single-column Update(...)
   // After V2H, each WALEntry stores only the column assignment, e.g. price(...)
-  std::unordered_map<std::string, std::vector<WALEntry>> columnEntries;
+  std::unordered_map<int32_t, std::vector<WALEntry>> columnEntries;
 
   // latest Delete for this row
   std::optional<DeleteEntry> deleteEntry;
@@ -950,13 +968,14 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
             }
 
             std::string colName = colHead.getName();
+            int32_t colId = internColumnName(colName);
             Expression valueExpr = std::move(colDynamics[0]);
 
             bool blind = isBlindValueWrite(valueExpr);
 
             int seq = bucket.nextSeq++;
 
-            auto [colIt, colInserted] = bucket.columnEntries.try_emplace(colName);
+            auto [colIt, colInserted] = bucket.columnEntries.try_emplace(colId);
             auto& colEntries = colIt->second;
 
             if(colInserted) {
@@ -1011,7 +1030,6 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
 // without needing to substitute concrete values here.
 
 static std::optional<Expression> resolveColumnEntries(
-  std::string const& colName,
   std::vector<WALEntry> const& entries,
   RowBucket const& bucket,
   int cutoffSeq)
@@ -1157,7 +1175,7 @@ static BucketResolution resolveBucketColumns(RowBucket const& bucket) {
     if(colLatestSeq == -1) continue; // all entries before delete, skip
 
     // resolve this column's entries
-    auto result = resolveColumnEntries(colName, entries, bucket, maxSeq);
+    auto result = resolveColumnEntries(entries, bucket, maxSeq);
     if(!result.has_value()) continue;
 
     // Find the Symbol for this column from the latest surviving entry.
@@ -1221,9 +1239,9 @@ static void optimiseBucketImpl(RowBucket& bucket) {
   // The resolved result is already the folded RHS value expression.
   // Do not rebuild price(valueExpr) here.
   for(auto& rc : resolution.columns) {
-    std::string colName = rc.columnName.getName();
+    int32_t colId = internColumnName(rc.columnName.getName());
 
-    auto [colIt, colInserted] = bucket.columnEntries.try_emplace(colName);
+    auto [colIt, colInserted] = bucket.columnEntries.try_emplace(colId);
     auto& colEntries = colIt->second;
 
     if(colInserted) {
@@ -1449,7 +1467,9 @@ static std::vector<Expression> flushBucket(
     countBeforeFlushed = countBeforeAll;
   } else {
     for(auto const& col : effectiveColumns) {
-      auto colIt = bucket.columnEntries.find(col);
+      auto nameIt = columnNameIntern.find(col);
+      if(nameIt == columnNameIntern.end()) continue;
+      auto colIt = bucket.columnEntries.find(nameIt->second);
       if(colIt != bucket.columnEntries.end()) {
         countBeforeFlushed += colIt->second.size();
       }
@@ -1523,9 +1543,9 @@ static std::vector<Expression> flushBucket(
     // here; the flushed ones don't need to be written back at all.
     bucket.columnEntries.clear();
     for(auto& rc : surviving) {
-      std::string colName = rc.columnName.getName();
+      int32_t colId = internColumnName(rc.columnName.getName());
 
-      auto [colIt, colInserted] = bucket.columnEntries.try_emplace(colName);
+      auto [colIt, colInserted] = bucket.columnEntries.try_emplace(colId);
       auto& colEntries = colIt->second;
 
       if(colInserted) {
@@ -1638,6 +1658,8 @@ static std::vector<SelectTarget> extractSelectKeys(ComplexExpression const& expr
   auto arg0 = expr.getArguments()[0];
   if(auto const* tableSymbol = get_if<boss::Symbol>(&arg0)) {
     std::string tableName = tableSymbol->getName();
+    auto tableIt = tableNameIntern.find(tableName);
+    if(tableIt == tableNameIntern.end()) return targets; // table not in WAL
 
     if(expr.getArguments().size() < 2) return targets;
     auto arg1 = expr.getArguments()[1];
@@ -1656,13 +1678,13 @@ static std::vector<SelectTarget> extractSelectKeys(ComplexExpression const& expr
     auto const* colSymbol = get_if<boss::Symbol>(&colArg);
     if(!colSymbol || colSymbol->getName() != "id") return targets;
 
+    int32_t tableId = tableIt->second;
     if(auto const* id32 = get_if<int32_t>(&valArg)) {
-      // empty columns = flush whole row
-      targets.push_back({{tableName, static_cast<int64_t>(*id32)}, {}});
+      targets.push_back({{tableId, static_cast<int64_t>(*id32)}, {}});
       return targets;
     }
     if(auto const* id64 = get_if<int64_t>(&valArg)) {
-      targets.push_back({{tableName, *id64}, {}});
+      targets.push_back({{tableId, *id64}, {}});
       return targets;
     }
     return targets;
@@ -1679,6 +1701,9 @@ static std::vector<SelectTarget> extractSelectKeys(ComplexExpression const& expr
   auto const* nameSymbol = get_if<boss::Symbol>(&nameArg);
   if(!nameSymbol) return targets;
   std::string tableName = nameSymbol->getName();
+  auto tableIt2 = tableNameIntern.find(tableName);
+  if(tableIt2 == tableNameIntern.end()) return targets; // table not in WAL
+  int32_t tableId2 = tableIt2->second;
 
   for(size_t i = 1; i < tableExpr->getArguments().size(); i++) {
     auto colArg = tableExpr->getArguments()[i];
@@ -1690,8 +1715,7 @@ static std::vector<SelectTarget> extractSelectKeys(ComplexExpression const& expr
     if(!listExpr) continue;
 
     visitRowIDs(*listExpr, [&](auto idValue) {
-      // empty columns = flush whole row
-      targets.push_back({{tableName, static_cast<int64_t>(idValue)}, {}});
+      targets.push_back({{tableId2, static_cast<int64_t>(idValue)}, {}});
     });
 
     if(!targets.empty()) break;
@@ -1941,7 +1965,7 @@ static Expression evaluate(Expression &&e) {
             //   ComplexExpression("Update"_, {}, std::move(walArgs), {})
             // );
 
-            WALKey key{tableSymbol->getName(), static_cast<int64_t>(idValue)};
+            WALKey key{internTableName(tableSymbol->getName()), static_cast<int64_t>(idValue)};
             boss::ExpressionArguments walArgs;
             walArgs.push_back(*tableSymbol);
             boss::ExpressionArguments idListArgs;
@@ -2001,7 +2025,7 @@ static Expression evaluate(Expression &&e) {
             // idColArgs.push_back(std::move(idList));
             // walArgs.push_back(ComplexExpression(idColName, {}, std::move(idColArgs), {}));
             // writeAheadLog.push_back(ComplexExpression("Delete"_, {}, std::move(walArgs), {}));
-            WALKey key{tableSymbol->getName(), static_cast<int64_t>(idValue)};
+            WALKey key{internTableName(tableSymbol->getName()), static_cast<int64_t>(idValue)};
             boss::ExpressionArguments walArgs;
             walArgs.push_back(*tableSymbol);
             boss::ExpressionArguments idListArgs;
@@ -2090,6 +2114,10 @@ static Expression evaluate(Expression &&e) {
           walIndex.clear();
           walOrder.clear();
           walTotalEntries = 0;
+          tableNameIntern.clear();
+          columnNameIntern.clear();
+          nextTableId = 0;
+          nextColumnId = 0;
           return "WAL_Cleared"_();
         }
         // OptimiseWAL — compact every bucket in place, WAL stays alive
@@ -2199,7 +2227,7 @@ static Expression evaluate(Expression &&e) {
             else if(auto const* id64 = get_if<int64_t>(&rowArg)) rowId = *id64;
             else return flushAllBuckets(FlushReason::Manual); // fallback
 
-            WALKey key{tableSymbol->getName(), rowId};
+            WALKey key{internTableName(tableSymbol->getName()), rowId};
             auto flushed = flushBucket(key, {}, FlushReason::Manual);
             boss::ExpressionArguments entries;
             for(auto& e : flushed) entries.push_back(std::move(e));
