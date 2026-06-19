@@ -2,9 +2,9 @@
 #include <Expression.hpp>
 #include <ExpressionUtilities.hpp>
 #include <Utilities.hpp>
+#include "ankerl/unordered_dense.h"
 #include <iostream>
 #include <vector>
-#include <list>
 #include <unordered_map>
 #include <optional>
 #include <algorithm>
@@ -74,6 +74,8 @@ struct WALKeyHash {
 // to small integers so WAL index and column entry map lookups hash integers, not strings.
 static std::unordered_map<std::string, int32_t> tableNameIntern;
 static std::unordered_map<std::string, int32_t> columnNameIntern;
+// Reverse lookup: colId → Symbol (populated alongside columnNameIntern)
+static std::vector<Symbol> columnIdToSymbol;
 static int32_t nextTableId = 0;
 static int32_t nextColumnId = 0;
 
@@ -85,13 +87,15 @@ static int32_t internTableName(std::string const& name) {
 
 static int32_t internColumnName(std::string const& name) {
   auto [it, inserted] = columnNameIntern.try_emplace(name, nextColumnId);
-  if(inserted) ++nextColumnId;
+  if(inserted) {
+    columnIdToSymbol.emplace_back(name);
+    ++nextColumnId;
+  }
   return it->second;
 }
 
 // One WAL entry: the raw expression and its global arrival sequence number
 struct WALEntry {
-  Symbol columnName;
   Expression valueExpr;
   int seq;
   bool isBlindWrite = false;
@@ -111,11 +115,56 @@ struct SelectTarget {
 };
 
  
+// Fix 3: Inline small array replacing unordered_map<int32_t, vector<WALEntry>>.
+// Most OLTP rows touch ≤8 columns; storing them inline avoids two heap pointer
+// hops per lookup and keeps the column map entirely on the stack / in-object.
+struct ColEntry {
+  int32_t colId = -1;
+  std::vector<WALEntry> entries;
+};
+
+struct InlineColVec {
+  static constexpr int N = 8;
+  ColEntry data[N];
+  int size = 0;
+
+  ColEntry* find(int32_t id) {
+    for(int i = 0; i < size; ++i)
+      if(data[i].colId == id) return &data[i];
+    return nullptr;
+  }
+  ColEntry const* find(int32_t id) const {
+    for(int i = 0; i < size; ++i)
+      if(data[i].colId == id) return &data[i];
+    return nullptr;
+  }
+
+  // Returns existing entry or inserts a new slot.
+  // Returns {nullptr, false} if the array is full (should not happen for ≤N columns).
+  std::pair<ColEntry*, bool> try_emplace(int32_t id) {
+    if(auto* p = find(id)) return {p, false};
+    if(size < N) {
+      data[size].colId = id;
+      data[size].entries.clear();
+      return {&data[size++], true};
+    }
+    return {nullptr, false}; // caller must handle null
+  }
+
+  ColEntry* begin() { return data; }
+  ColEntry* end()   { return data + size; }
+  ColEntry const* begin() const { return data; }
+  ColEntry const* end()   const { return data + size; }
+  bool empty() const { return size == 0; }
+  void clear() {
+    for(int i = 0; i < size; ++i) data[i].entries.clear();
+    size = 0;
+  }
+};
+
 struct RowBucket {
-  // per-column entry lists
-  // Before V2H, each WALEntry stored a single-column Update(...)
-  // After V2H, each WALEntry stores only the column assignment, e.g. price(...)
-  std::unordered_map<int32_t, std::vector<WALEntry>> columnEntries;
+  // per-column entry lists — inline fixed-size array (Fix 3)
+  InlineColVec columnEntries;
 
   // latest Delete for this row
   std::optional<DeleteEntry> deleteEntry;
@@ -127,18 +176,13 @@ struct RowBucket {
 
   // monotonically increasing counter across columns
   int nextSeq = 0;
-
-  // iterator into walOrder for O(1) removal on flush
-  std::list<WALKey>::iterator orderIter;
 };
  
 // the WAL index: (tableName, rowID) → bucket
-static std::unordered_map<WALKey, RowBucket, WALKeyHash> walIndex;
- 
-// insertion order of keys — so flush emits entries in the order rows were first touched
-// std::list gives stable iterators — each RowBucket stores its own iterator for O(1) removal
-static std::list<WALKey> walOrder;
- 
+// Fix 2: ankerl::unordered_dense stores entries in a flat contiguous array,
+// eliminating one heap pointer hop per lookup compared to std::unordered_map.
+static ankerl::unordered_dense::map<WALKey, RowBucket, WALKeyHash> walIndex;
+
 // total number of entries across all buckets — for threshold check
 static size_t walTotalEntries = 0;
  
@@ -697,11 +741,11 @@ static size_t countSymbolOccurrences(Expression const& expr, Symbol const& targe
   );
 }
 
-static Expression buildColumnExpression(WALEntry const& entry) {
+static Expression buildColumnExpression(Symbol const& colName, WALEntry const& entry) {
   boss::ExpressionArguments colArgs;
   colArgs.push_back(entry.valueExpr.clone());
 
-  return ComplexExpression(entry.columnName, {}, std::move(colArgs), {});
+  return ComplexExpression(colName, {}, std::move(colArgs), {});
 }
 
 // ============================================================
@@ -932,11 +976,6 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
   // which performs repeated hash-table lookup work.
   auto [bucketIt, inserted] = walIndex.try_emplace(key);
 
-  if(inserted) {
-    walOrder.push_back(key);
-    bucketIt->second.orderIter = std::prev(walOrder.end());
-  }
-
   RowBucket& bucket = bucketIt->second;
 
   if(auto* entry = get_if<ComplexExpression>(&walEntry)) {
@@ -975,15 +1014,15 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
 
             int seq = bucket.nextSeq++;
 
-            auto [colIt, colInserted] = bucket.columnEntries.try_emplace(colId);
-            auto& colEntries = colIt->second;
+            auto [colPtr2, colInserted] = bucket.columnEntries.try_emplace(colId);
+            if(!colPtr2) continue; // too many columns (>N) — should not happen for OLTP
+            auto& colEntries = colPtr2->entries;
 
             if(colInserted) {
               colEntries.reserve(WAL_COLUMN_ENTRY_RESERVE);
             }
 
             colEntries.push_back({
-              std::move(colHead),
               std::move(valueExpr),
               seq,
               blind
@@ -1032,8 +1071,10 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
 static std::optional<Expression> resolveColumnEntries(
   std::vector<WALEntry> const& entries,
   RowBucket const& bucket,
-  int cutoffSeq)
+  int cutoffSeq,
+  int32_t colId)
 {
+  Symbol const& colSym = columnIdToSymbol[colId];
   std::optional<Expression> resolvedValue;
 
   for(int idx = static_cast<int>(entries.size()) - 1; idx >= 0; idx--) {
@@ -1055,14 +1096,14 @@ static std::optional<Expression> resolveColumnEntries(
     } else {
       if(walEntry.isBlindWrite) {
         resolvedValue = foldColumnValues(
-          walEntry.columnName,
+          colSym,
           walEntry.valueExpr,
           *resolvedValue
         );
         break;
       } else {
         resolvedValue = foldColumnValues(
-          walEntry.columnName,
+          colSym,
           walEntry.valueExpr,
           *resolvedValue
         );
@@ -1158,15 +1199,18 @@ static BucketResolution resolveBucketColumns(RowBucket const& bucket) {
   // find the maximum seq across all surviving entries — used as cutoff for resolution
   // "surviving" means seq > deleteSeq
   int maxSeq = deleteSeq; // start at deleteSeq, will be updated as we find surviving entries
-  for(auto const& [colName, entries] : bucket.columnEntries) {
-    for(auto const& e : entries) {
+  for(auto const& col : bucket.columnEntries) {
+    for(auto const& e : col.entries) {
       if(e.seq > deleteSeq && e.seq > maxSeq) maxSeq = e.seq;
     }
   }
 
   std::vector<ResolvedCol> resolved;
 
-  for(auto const& [colName, entries] : bucket.columnEntries) {
+  for(auto const& col : bucket.columnEntries) {
+    auto const& entries = col.entries;
+    int32_t colId = col.colId;
+
     // find the latest surviving entry seq for this column
     int colLatestSeq = -1;
     for(auto const& e : entries) {
@@ -1175,25 +1219,14 @@ static BucketResolution resolveBucketColumns(RowBucket const& bucket) {
     if(colLatestSeq == -1) continue; // all entries before delete, skip
 
     // resolve this column's entries
-    auto result = resolveColumnEntries(entries, bucket, maxSeq);
+    auto result = resolveColumnEntries(entries, bucket, maxSeq, colId);
     if(!result.has_value()) continue;
 
-    // Find the Symbol for this column from the latest surviving entry.
-    // We need the Symbol because result is now only the RHS value expression,
-    // not the full column expression.
-    std::optional<Symbol> columnSymbol;
-
-    for(auto const& e : entries) {
-      if(e.seq == colLatestSeq) {
-        columnSymbol = e.columnName;
-        break;
-      }
-    }
-
-    if(!columnSymbol.has_value()) continue;
+    // Symbol comes from the intern table — no need to search entries
+    Symbol const& colSym = columnIdToSymbol[colId];
 
     resolved.push_back({
-      *columnSymbol,
+      colSym,
       std::move(*result),
       colLatestSeq
     });
@@ -1241,8 +1274,9 @@ static void optimiseBucketImpl(RowBucket& bucket) {
   for(auto& rc : resolution.columns) {
     int32_t colId = internColumnName(rc.columnName.getName());
 
-    auto [colIt, colInserted] = bucket.columnEntries.try_emplace(colId);
-    auto& colEntries = colIt->second;
+    auto [colPtr, colInserted] = bucket.columnEntries.try_emplace(colId);
+    if(!colPtr) continue; // too many columns — should not happen for OLTP
+    auto& colEntries = colPtr->entries;
 
     if(colInserted) {
       colEntries.reserve(1);
@@ -1252,7 +1286,6 @@ static void optimiseBucketImpl(RowBucket& bucket) {
 
     // Keep latestSeq so flushBucket can emit columns in dependency-safe order.
     colEntries.push_back({
-      rc.columnName,
       std::move(rc.valueExpr),
       rc.latestSeq,
       blind
@@ -1453,8 +1486,8 @@ static std::vector<Expression> flushBucket(
   // This is needed for walTotalEntries accounting because resolveBucketColumns()
   // resolves the entire bucket, even during a selective flush.
   size_t countBeforeAll = 0;
-  for(auto const& [col, entries] : bucket.columnEntries) {
-    countBeforeAll += entries.size();
+  for(auto const& col : bucket.columnEntries) {
+    countBeforeAll += col.entries.size();
   }
   if(bucket.deleteEntry.has_value()) {
     countBeforeAll++;
@@ -1466,12 +1499,12 @@ static std::vector<Expression> flushBucket(
   if(flushingAllColumns) {
     countBeforeFlushed = countBeforeAll;
   } else {
-    for(auto const& col : effectiveColumns) {
-      auto nameIt = columnNameIntern.find(col);
+    for(auto const& colName : effectiveColumns) {
+      auto nameIt = columnNameIntern.find(colName);
       if(nameIt == columnNameIntern.end()) continue;
-      auto colIt = bucket.columnEntries.find(nameIt->second);
-      if(colIt != bucket.columnEntries.end()) {
-        countBeforeFlushed += colIt->second.size();
+      auto* colPtr = bucket.columnEntries.find(nameIt->second);
+      if(colPtr) {
+        countBeforeFlushed += colPtr->entries.size();
       }
     }
   }
@@ -1505,10 +1538,9 @@ static std::vector<Expression> flushBucket(
       result.push_back(std::move(*update));
     }
 
-    // whole-row flush — the bucket (and its columnEntries map) is about to
+    // whole-row flush — the bucket (and its columnEntries array) is about to
     // be destroyed entirely, so there is nothing left to persist.
     walTotalEntries -= countBeforeAll;
-    walOrder.erase(it->second.orderIter);
     walIndex.erase(it);
 
   } else {
@@ -1545,8 +1577,9 @@ static std::vector<Expression> flushBucket(
     for(auto& rc : surviving) {
       int32_t colId = internColumnName(rc.columnName.getName());
 
-      auto [colIt, colInserted] = bucket.columnEntries.try_emplace(colId);
-      auto& colEntries = colIt->second;
+      auto [colPtr, colInserted] = bucket.columnEntries.try_emplace(colId);
+      if(!colPtr) continue; // too many columns — should not happen for OLTP
+      auto& colEntries = colPtr->entries;
 
       if(colInserted) {
         colEntries.reserve(1);
@@ -1555,7 +1588,6 @@ static std::vector<Expression> flushBucket(
       bool blind = isBlindValueWrite(rc.valueExpr);
 
       colEntries.push_back({
-        rc.columnName,
         std::move(rc.valueExpr),
         rc.latestSeq,
         blind
@@ -1573,7 +1605,6 @@ static std::vector<Expression> flushBucket(
     // if all columns have been flushed, remove the bucket entirely
     // otherwise leave it alive for the remaining columns
     if(bucket.columnEntries.empty() && !bucket.deleteEntry.has_value()) {
-      walOrder.erase(it->second.orderIter);
       walIndex.erase(it);
     }
   }
@@ -1728,8 +1759,11 @@ static Expression flushAllBuckets(FlushReason reason = FlushReason::Manual) {
   // commented out for better testing output
   // std::cout << "WAL: flushing all " << walTotalEntries << " entries" << std::endl;
   boss::ExpressionArguments entries;
-  auto keysCopy = walOrder; // copy because flushBucket modifies walOrder
-  for(auto const& key : keysCopy) {
+  // Copy keys because flushBucket modifies walIndex (erases buckets)
+  std::vector<WALKey> keys;
+  keys.reserve(walIndex.size());
+  for(auto const& [k, _] : walIndex) keys.push_back(k);
+  for(auto const& key : keys) {
     auto flushed = flushBucket(key, {}, reason);
     for(auto& e : flushed) entries.push_back(std::move(e));
   }
@@ -2047,27 +2081,25 @@ static Expression evaluate(Expression &&e) {
           return "Delete_Logged"_();
         }
 
-        // GetWAL — return raw chain contents flattened in walOrder sequence
+        // GetWAL — return raw chain contents flattened in seq order
         if (head == "GetWAL"_) {
           boss::ExpressionArguments entries;
-          for(auto const& key : walOrder) {
-            auto it = walIndex.find(key);
-            if(it == walIndex.end()) continue;
-            auto const& bucket = it->second;
- 
+          for(auto const& [key, bucket] : walIndex) {
+
             // collect all entries across columns with their seq numbers
             std::vector<std::pair<int, Expression>> allEntries;
-            for(auto const& [col, colEntries] : bucket.columnEntries) {
-              for(auto const& e : colEntries)
-                allEntries.push_back({e.seq, buildColumnExpression(e)});
+            for(auto const& col : bucket.columnEntries) {
+              Symbol const& colSym = columnIdToSymbol[col.colId];
+              for(auto const& e : col.entries)
+                allEntries.push_back({e.seq, buildColumnExpression(colSym, e)});
             }
             if(bucket.deleteEntry.has_value())
               allEntries.push_back({bucket.deleteEntry->seq, bucket.deleteEntry->expr.clone()});
- 
+
             // sort by seq to return in arrival order
             std::sort(allEntries.begin(), allEntries.end(),
               [](auto const& a, auto const& b) { return a.first < b.first; });
- 
+
             // deduplicate — multiple columns in same Update share same seq
             // we only want to emit each Update expression once
             int lastSeq = -1;
@@ -2112,10 +2144,10 @@ static Expression evaluate(Expression &&e) {
         // ClearWAL - empty the log
         if (head == "ClearWAL"_) {
           walIndex.clear();
-          walOrder.clear();
           walTotalEntries = 0;
           tableNameIntern.clear();
           columnNameIntern.clear();
+          columnIdToSymbol.clear();
           nextTableId = 0;
           nextColumnId = 0;
           return "WAL_Cleared"_();
@@ -2124,21 +2156,17 @@ static Expression evaluate(Expression &&e) {
         if(head == "OptimiseWAL"_) {
           // commented out for better testing output
           // std::cout << "WAL: optimising " << walTotalEntries << " entries" << std::endl;
-          for(auto const& key : walOrder) {
-            auto it = walIndex.find(key);
-            if(it == walIndex.end()) continue;
-            RowBucket& bucket = it->second;
-
+          for(auto& [key, bucket] : walIndex) {
             // count entries before optimise
             size_t countBefore = 0;
-            for(auto const& [col, entries] : bucket.columnEntries) countBefore += entries.size();
+            for(auto const& col : bucket.columnEntries) countBefore += col.entries.size();
             if(bucket.deleteEntry.has_value()) countBefore++;
 
             optimiseBucketImpl(bucket);
 
             // count entries after optimise
             size_t countAfter = 0;
-            for(auto const& [col, entries] : bucket.columnEntries) countAfter += entries.size();
+            for(auto const& col : bucket.columnEntries) countAfter += col.entries.size();
             if(bucket.deleteEntry.has_value()) countAfter++;
 
             walTotalEntries -= countBefore;
@@ -2165,7 +2193,9 @@ static Expression evaluate(Expression &&e) {
           } else {
             // could not parse — fall back to full flush for correctness
             // std::cout << "WAL: Project fallback to full flush" << std::endl;
-            auto keysCopy = walOrder;
+            std::vector<WALKey> keysCopy;
+            keysCopy.reserve(walIndex.size());
+            for(auto const& [k, _] : walIndex) keysCopy.push_back(k);
             for(auto const& key : keysCopy) {
               auto flushed = flushBucket(key, {}, FlushReason::ReadTriggered);
               for(auto& e : flushed) applyArgs.push_back(std::move(e));
@@ -2194,7 +2224,9 @@ static Expression evaluate(Expression &&e) {
             // could not parse row IDs — fall back to full flush for correctness
             // commented out for better testing output
             // std::cout << "WAL: Select fallback to full flush" << std::endl;
-            auto keysCopy = walOrder;
+            std::vector<WALKey> keysCopy;
+            keysCopy.reserve(walIndex.size());
+            for(auto const& [k, _] : walIndex) keysCopy.push_back(k);
             for(auto const& key : keysCopy) {
               auto flushed = flushBucket(key, {}, FlushReason::ReadTriggered);
               for(auto& e : flushed) applyArgs.push_back(std::move(e));
