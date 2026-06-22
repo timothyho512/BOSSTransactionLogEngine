@@ -846,121 +846,6 @@ static Expression foldColumnValues(Symbol const& colName,
   return foldedValue;
 }
 
-// Fold two dependent writes on the same column into one composed expression
-// e.g. price(Plus(price, 1)) followed by price(Plus(price, 1))
-// becomes price(Plus(Plus(price, 1), 1))
-// the earlier write's value gets substituted as the "current value" for the later write
-static Expression foldColumnWrites(ComplexExpression const& earlier,
-                                   ComplexExpression const& later) {
-  // earlier = price(Plus(price, 1))
-  // later   = price(Plus(price, 1))
-  // result  = price(Plus(Plus(price, 1), 1))
-  // we substitute the earlier's value expression wherever
-  // "price" Symbol appears in the later's value expression
-
-  auto colName = later.getHead(); // e.g. "price"
-
-  auto const& laterArgs = later.getArguments();
-
-  // Count how many times the later expression refers to this column.
-  // If it appears once, we can move earlierValue into the folded expression.
-  // If it appears more than once, we must clone for each replacement.
-  size_t replacementCount = 0;
-
-  if(!laterArgs.empty()) {
-    replacementCount = countSymbolOccurrencesArgument(laterArgs[0], colName);
-  }
-
-  auto earlierValue = earlier.cloneArgument(0);
-
-  bool canMoveEarlierValue = replacementCount == 1;
-  bool earlierValueMoved = false;
-
-  std::function<Expression(Expression const&)> substituteExpr;
-
-  auto substituteValue = [&](auto const& value) -> Expression {
-    using Decayed = std::decay_t<decltype(value)>;
-
-    if constexpr(std::is_same_v<Decayed, Symbol>) {
-      if(value == colName) {
-        if(canMoveEarlierValue && !earlierValueMoved) {
-          earlierValueMoved = true;
-          return std::move(earlierValue);
-        }
-
-        return earlierValue.clone();
-      }
-
-      return value;
-    } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
-      boss::ExpressionArguments newArgs;
-      auto const& args = value.getArguments();
-      newArgs.reserve(args.size());
-
-      for(auto const& arg : args) {
-        newArgs.push_back(std::visit(
-          [&](auto const& unwrapped) -> Expression {
-            using Inner = std::decay_t<decltype(unwrapped)>;
-
-            if constexpr(boss::utilities::isInstanceOfTemplate<
-                           Inner, boss::expressions::generic::MovableReferenceWrapper>::value) {
-              return substituteExpr(unwrapped.get());
-            } else {
-              return substituteExpr(unwrapped);
-            }
-          },
-          arg.getArgument()
-        ));
-      }
-
-      return ComplexExpression(value.getHead(), {}, std::move(newArgs), {});
-    } else if constexpr(std::is_same_v<Decayed, Expression>) {
-      return substituteExpr(value);
-    } else {
-      return value;
-    }
-  };
-
-  substituteExpr = [&](Expression const& expr) -> Expression {
-    return std::visit(
-      [&](auto const& value) -> Expression {
-        return substituteValue(value);
-      },
-      expr
-    );
-  };
-
-  if(laterArgs.empty()) {
-    boss::ExpressionArguments colArgs;
-    colArgs.push_back(std::move(earlierValue));
-    return ComplexExpression(colName, {}, std::move(colArgs), {});
-  }
-
-  auto foldedValue = std::visit(
-    [&](auto const& unwrapped) -> Expression {
-      using Inner = std::decay_t<decltype(unwrapped)>;
-
-      if constexpr(boss::utilities::isInstanceOfTemplate<
-                     Inner, boss::expressions::generic::MovableReferenceWrapper>::value) {
-        return substituteExpr(unwrapped.get());
-      } else {
-        return substituteExpr(unwrapped);
-      }
-    },
-    laterArgs[0].getArgument()
-  );
-
-  // attempt constant folding — simplifies same-operator chains
-  // e.g. Plus(Plus(price, 1), 1) → Plus(price, 2)
-  if(auto simplified = tryConstantFold(foldedValue)) {
-    foldedValue = std::move(*simplified);
-  }
-
-  boss::ExpressionArguments colArgs;
-  colArgs.push_back(std::move(foldedValue));
-  return ComplexExpression(colName, {}, std::move(colArgs), {});
-}
-
 // ============================================================
 // walIndexPush — capture one raw entry into the right bucket
 // ============================================================
@@ -1115,59 +1000,6 @@ static std::optional<Expression> resolveColumnEntries(
 }
 
 // ============================================================
-// collectSymbolNames — find all Symbol names in an expression
-// ============================================================
-//
-// Used to detect cross-column dependencies: if column X's expression
-// contains Symbol "price", and "price" is a column in the same bucket,
-// then X depends on price.
- 
-template <typename T>
-static void collectSymbolNamesValue(T const& value, std::vector<std::string>& names);
-
-template <typename WrappedArgument>
-static void collectSymbolNamesArgument(WrappedArgument const& wrappedArg,
-                                       std::vector<std::string>& names) {
-  visitArgumentByReference(
-    wrappedArg,
-    [&](auto const& unwrapped) {
-      collectSymbolNamesValue(unwrapped, names);
-    }
-  );
-}
-
-static void collectSymbolNames(Expression const& expr, std::vector<std::string>& names) {
-  std::visit(
-    [&](auto const& value) {
-      collectSymbolNamesValue(value, names);
-    },
-    expr
-  );
-}
-
-template <typename T>
-static void collectSymbolNamesValue(T const& value, std::vector<std::string>& names) {
-  using Decayed = std::decay_t<T>;
-
-  if constexpr(boss::utilities::isInstanceOfTemplate<
-                 Decayed, boss::expressions::generic::MovableReferenceWrapper>::value) {
-    collectSymbolNamesValue(value.get(), names);
-  } else if constexpr(std::is_same_v<Decayed, Symbol>) {
-    names.push_back(value.getName());
-  } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
-    auto const& args = value.getArguments();
-
-    for(auto const& arg : args) {
-      collectSymbolNamesArgument(arg, names);
-    }
-  } else if constexpr(std::is_same_v<Decayed, Expression>) {
-    collectSymbolNames(value, names);
-  } else {
-    // concrete literals do not contain Symbol dependencies
-  }
-}
-
-// ============================================================
 // ResolvedCol / resolveBucketColumns — read-only column resolution
 // ============================================================
 //
@@ -1182,9 +1014,11 @@ static void collectSymbolNamesValue(T const& value, std::vector<std::string>& na
 // first. Does NOT mutate the bucket — see optimiseBucketImpl below for the
 // "resolve and persist back into columnEntries" version.
 struct ResolvedCol {
+  int32_t colId;
   Symbol columnName;
   Expression valueExpr;
   int latestSeq;
+  bool isBlind;
 };
 
 struct BucketResolution {
@@ -1196,39 +1030,41 @@ static BucketResolution resolveBucketColumns(RowBucket const& bucket) {
   // deleteSeq: entries at or before this seq are discarded
   int deleteSeq = bucket.deleteEntry.has_value() ? bucket.deleteEntry->seq : -1;
 
-  // find the maximum seq across all surviving entries — used as cutoff for resolution
-  // "surviving" means seq > deleteSeq
-  int maxSeq = deleteSeq; // start at deleteSeq, will be updated as we find surviving entries
-  for(auto const& col : bucket.columnEntries) {
-    for(auto const& e : col.entries) {
-      if(e.seq > deleteSeq && e.seq > maxSeq) maxSeq = e.seq;
+  // Single pass: compute global maxSeq and per-column colLatestSeq together,
+  // avoiding a separate first pass just for maxSeq.
+  int maxSeq = deleteSeq;
+  int colLatestSeqs[InlineColVec::N];
+  std::fill(colLatestSeqs, colLatestSeqs + InlineColVec::N, -1);
+
+  for(int ci = 0; ci < bucket.columnEntries.size; ++ci) {
+    for(auto const& e : bucket.columnEntries.data[ci].entries) {
+      if(e.seq > deleteSeq) {
+        if(e.seq > maxSeq) maxSeq = e.seq;
+        if(e.seq > colLatestSeqs[ci]) colLatestSeqs[ci] = e.seq;
+      }
     }
   }
 
   std::vector<ResolvedCol> resolved;
 
-  for(auto const& col : bucket.columnEntries) {
-    auto const& entries = col.entries;
-    int32_t colId = col.colId;
+  for(int ci = 0; ci < bucket.columnEntries.size; ++ci) {
+    if(colLatestSeqs[ci] == -1) continue; // all entries before delete, skip
 
-    // find the latest surviving entry seq for this column
-    int colLatestSeq = -1;
-    for(auto const& e : entries) {
-      if(e.seq > deleteSeq && e.seq > colLatestSeq) colLatestSeq = e.seq;
-    }
-    if(colLatestSeq == -1) continue; // all entries before delete, skip
+    int32_t colId = bucket.columnEntries.data[ci].colId;
+    auto const& entries = bucket.columnEntries.data[ci].entries;
 
-    // resolve this column's entries
     auto result = resolveColumnEntries(entries, bucket, maxSeq, colId);
     if(!result.has_value()) continue;
 
-    // Symbol comes from the intern table — no need to search entries
     Symbol const& colSym = columnIdToSymbol[colId];
+    bool blind = isBlindValueWrite(*result);
 
     resolved.push_back({
+      colId,
       colSym,
       std::move(*result),
-      colLatestSeq
+      colLatestSeqs[ci],
+      blind
     });
   }
 
@@ -1272,9 +1108,7 @@ static void optimiseBucketImpl(RowBucket& bucket) {
   // The resolved result is already the folded RHS value expression.
   // Do not rebuild price(valueExpr) here.
   for(auto& rc : resolution.columns) {
-    int32_t colId = internColumnName(rc.columnName.getName());
-
-    auto [colPtr, colInserted] = bucket.columnEntries.try_emplace(colId);
+    auto [colPtr, colInserted] = bucket.columnEntries.try_emplace(rc.colId);
     if(!colPtr) continue; // too many columns — should not happen for OLTP
     auto& colEntries = colPtr->entries;
 
@@ -1282,13 +1116,11 @@ static void optimiseBucketImpl(RowBucket& bucket) {
       colEntries.reserve(1);
     }
 
-    bool blind = isBlindValueWrite(rc.valueExpr);
-
     // Keep latestSeq so flushBucket can emit columns in dependency-safe order.
     colEntries.push_back({
       std::move(rc.valueExpr),
       rc.latestSeq,
-      blind
+      rc.isBlind
     });
   }
 
@@ -1575,9 +1407,7 @@ static std::vector<Expression> flushBucket(
     // here; the flushed ones don't need to be written back at all.
     bucket.columnEntries.clear();
     for(auto& rc : surviving) {
-      int32_t colId = internColumnName(rc.columnName.getName());
-
-      auto [colPtr, colInserted] = bucket.columnEntries.try_emplace(colId);
+      auto [colPtr, colInserted] = bucket.columnEntries.try_emplace(rc.colId);
       if(!colPtr) continue; // too many columns — should not happen for OLTP
       auto& colEntries = colPtr->entries;
 
@@ -1585,12 +1415,10 @@ static std::vector<Expression> flushBucket(
         colEntries.reserve(1);
       }
 
-      bool blind = isBlindValueWrite(rc.valueExpr);
-
       colEntries.push_back({
         std::move(rc.valueExpr),
         rc.latestSeq,
-        blind
+        rc.isBlind
       });
     }
     bucket.nextSeq = resolution.maxSeq + 1;
