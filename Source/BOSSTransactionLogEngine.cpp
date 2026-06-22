@@ -819,7 +819,7 @@ static Expression substituteAndFold(Expression const& expr,
 }
 
 static Expression foldColumnValues(Symbol const& colName,
-                                   Expression const& earlierValueExpr,
+                                   Expression earlierValueExpr,
                                    Expression const& laterValueExpr) {
   // earlierValueExpr = Plus(price, 1)
   // laterValueExpr   = Plus(price, 1)
@@ -830,13 +830,11 @@ static Expression foldColumnValues(Symbol const& colName,
 
   size_t replacementCount = countSymbolOccurrences(laterValueExpr, colName);
 
-  Expression earlierValue = earlierValueExpr.clone();
-
   bool canMoveEarlierValue = replacementCount == 1;
   bool earlierValueMoved = false;
 
   Expression foldedValue = substituteAndFold(
-    laterValueExpr, colName, earlierValue, canMoveEarlierValue, earlierValueMoved);
+    laterValueExpr, colName, earlierValueExpr, canMoveEarlierValue, earlierValueMoved);
 
   // top-level constant fold (inner nodes already folded by substituteAndFoldValue)
   if(auto simplified = tryConstantFold(foldedValue)) {
@@ -954,7 +952,7 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
 // without needing to substitute concrete values here.
 
 static std::optional<Expression> resolveColumnEntries(
-  std::vector<WALEntry> const& entries,
+  std::vector<WALEntry>& entries,
   RowBucket const& bucket,
   int cutoffSeq,
   int32_t colId)
@@ -963,7 +961,7 @@ static std::optional<Expression> resolveColumnEntries(
   std::optional<Expression> resolvedValue;
 
   for(int idx = static_cast<int>(entries.size()) - 1; idx >= 0; idx--) {
-    WALEntry const& walEntry = entries[idx];
+    WALEntry& walEntry = entries[idx];
 
     if(walEntry.seq > cutoffSeq) continue;
 
@@ -973,23 +971,23 @@ static std::optional<Expression> resolveColumnEntries(
 
     if(!resolvedValue.has_value()) {
       if(walEntry.isBlindWrite) {
-        resolvedValue = walEntry.valueExpr.clone();
+        resolvedValue = std::move(walEntry.valueExpr);
         break;
       } else {
-        resolvedValue = walEntry.valueExpr.clone();
+        resolvedValue = std::move(walEntry.valueExpr);
       }
     } else {
       if(walEntry.isBlindWrite) {
         resolvedValue = foldColumnValues(
           colSym,
-          walEntry.valueExpr,
+          std::move(walEntry.valueExpr),
           *resolvedValue
         );
         break;
       } else {
         resolvedValue = foldColumnValues(
           colSym,
-          walEntry.valueExpr,
+          std::move(walEntry.valueExpr),
           *resolvedValue
         );
       }
@@ -1026,7 +1024,7 @@ struct BucketResolution {
   int maxSeq;
 };
 
-static BucketResolution resolveBucketColumns(RowBucket const& bucket) {
+static BucketResolution resolveBucketColumns(RowBucket& bucket) {
   // deleteSeq: entries at or before this seq are discarded
   int deleteSeq = bucket.deleteEntry.has_value() ? bucket.deleteEntry->seq : -1;
 
@@ -1051,7 +1049,7 @@ static BucketResolution resolveBucketColumns(RowBucket const& bucket) {
     if(colLatestSeqs[ci] == -1) continue; // all entries before delete, skip
 
     int32_t colId = bucket.columnEntries.data[ci].colId;
-    auto const& entries = bucket.columnEntries.data[ci].entries;
+    auto& entries = bucket.columnEntries.data[ci].entries;
 
     auto result = resolveColumnEntries(entries, bucket, maxSeq, colId);
     if(!result.has_value()) continue;
@@ -1263,8 +1261,9 @@ static void optimiseBucketImpl(RowBucket& bucket) {
 // guarantees this, and partitioning it preserves relative order), so no
 // re-sort is needed here.
 static std::optional<Expression> buildUpdateFromResolvedColumns(
-  RowBucket const& bucket,
-  std::vector<ResolvedCol>& selected)
+  RowBucket& bucket,
+  std::vector<ResolvedCol>& selected,
+  bool consuming = false)
 {
   if(!bucket.tableName.has_value() || !bucket.idExpr.has_value()) {
     return std::nullopt;
@@ -1284,8 +1283,13 @@ static std::optional<Expression> buildUpdateFromResolvedColumns(
   }
 
   boss::ExpressionArguments updateArgs;
-  updateArgs.push_back(bucket.tableName->clone());
-  updateArgs.push_back(bucket.idExpr->clone());
+  if(consuming) {
+    updateArgs.push_back(std::move(*bucket.tableName));
+    updateArgs.push_back(std::move(*bucket.idExpr));
+  } else {
+    updateArgs.push_back(bucket.tableName->clone());
+    updateArgs.push_back(bucket.idExpr->clone());
+  }
   updateArgs.push_back(ComplexExpression("Set"_, {}, std::move(selectedCols), {}));
 
   return ComplexExpression("Update"_, {}, std::move(updateArgs), {});
@@ -1366,7 +1370,7 @@ static std::vector<Expression> flushBucket(
     // V2P: build the final physical Update directly from the resolved
     // columns — every column is being flushed, so none need to be written
     // into bucket.columnEntries before the bucket is erased below.
-    if(auto update = buildUpdateFromResolvedColumns(bucket, resolution.columns)) {
+    if(auto update = buildUpdateFromResolvedColumns(bucket, resolution.columns, true)) {
       result.push_back(std::move(*update));
     }
 
@@ -1808,37 +1812,30 @@ static Expression evaluate(Expression &&e) {
           idListExpr = get_if<ComplexExpression>(&listArg);
           if (!idListExpr) return std::move(expr);
 
-          // Extract the "Set"_ expression
+          // Extract the "Set"_ expression — setArg is already an owned copy
           auto setArg = expr.getArguments()[2];
-          auto const* setExpr = get_if<ComplexExpression>(&setArg);
-          if(!setExpr) return std::move(expr);
+          if(!get_if<ComplexExpression>(&setArg)) return std::move(expr);
 
-          visitRowIDs(*idListExpr, [&](auto idValue) {
-            // boss::ExpressionArguments walArgs;
-            // walArgs.push_back(*tableSymbol);
-            // boss::ExpressionArguments idListArgs;
-            // idListArgs.push_back(idValue);
-            // auto idList = ComplexExpression("List"_, {}, std::move(idListArgs), {});
-            // boss::ExpressionArguments idColArgs;
-            // idColArgs.push_back(std::move(idList));
-            // walArgs.push_back(ComplexExpression(idColName, {}, std::move(idColArgs), {}));
-            // walArgs.push_back(setExpr->clone());
-            // writeAheadLog.push_back(
-            //   ComplexExpression("Update"_, {}, std::move(walArgs), {})
-            // );
+          // Collect row IDs before consuming setArg so we know when the last
+          // iteration is and can move instead of clone on that final push.
+          std::vector<RowID> rowIds;
+          visitRowIDs(*idListExpr, [&](auto idValue) { rowIds.push_back(idValue); });
 
-            WALKey key{internTableName(tableSymbol->getName()), static_cast<int64_t>(idValue)};
+          int32_t tableId = internTableName(tableSymbol->getName());
+          for(size_t i = 0; i < rowIds.size(); ++i) {
+            bool isLast = (i + 1 == rowIds.size());
+            WALKey key{tableId, toInt64(rowIds[i])};
             boss::ExpressionArguments walArgs;
             walArgs.push_back(*tableSymbol);
             boss::ExpressionArguments idListArgs;
-            idListArgs.push_back(idValue);
+            std::visit([&](auto id) { idListArgs.push_back(id); }, rowIds[i]);
             auto idList = ComplexExpression("List"_, {}, std::move(idListArgs), {});
             boss::ExpressionArguments idColArgs;
             idColArgs.push_back(std::move(idList));
             walArgs.push_back(ComplexExpression(idColName, {}, std::move(idColArgs), {}));
-            walArgs.push_back(setExpr->clone());
+            walArgs.push_back(isLast ? std::move(setArg) : setArg.clone());
             walIndexPush(key, ComplexExpression("Update"_, {}, std::move(walArgs), {}));
-          });
+          }
 
           // commented out for better testing output
           // std::cout << "WAL: captured Update" << std::endl;
