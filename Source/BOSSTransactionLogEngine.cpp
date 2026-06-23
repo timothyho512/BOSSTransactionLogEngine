@@ -74,6 +74,8 @@ struct WALKeyHash {
 // to small integers so WAL index and column entry map lookups hash integers, not strings.
 static std::unordered_map<std::string, int32_t> tableNameIntern;
 static std::unordered_map<std::string, int32_t> columnNameIntern;
+// Reverse lookup: tableId -> Symbol (populated alongside tableNameIntern)
+static std::vector<Symbol> tableIdToSymbol;
 // Reverse lookup: colId → Symbol (populated alongside columnNameIntern)
 static std::vector<Symbol> columnIdToSymbol;
 static int32_t nextTableId = 0;
@@ -81,7 +83,10 @@ static int32_t nextColumnId = 0;
 
 static int32_t internTableName(std::string const& name) {
   auto [it, inserted] = tableNameIntern.try_emplace(name, nextTableId);
-  if(inserted) ++nextTableId;
+  if(inserted) {
+    tableIdToSymbol.emplace_back(name);
+    ++nextTableId;
+  }
   return it->second;
 }
 
@@ -102,7 +107,6 @@ struct WALEntry {
 };
 
 struct DeleteEntry {
-  Expression expr;
   int seq;
 };
 
@@ -169,10 +173,11 @@ struct RowBucket {
   // latest Delete for this row
   std::optional<DeleteEntry> deleteEntry;
 
-  // table and row id are the same for every entry in this row bucket
-  // so store them once instead of cloning them into every column entry
-  std::optional<Expression> tableName;
-  std::optional<Expression> idExpr;
+  // Canonical row identity. Keep semantic scalars here and reconstruct BOSS
+  // output expressions at the flush boundary instead of cloning stored syntax.
+  int32_t tableId = -1;
+  RowID rowId = int64_t{0};
+  int32_t idColumnId = -1;
 
   // monotonically increasing counter across columns
   int nextSeq = 0;
@@ -749,6 +754,56 @@ static Expression buildColumnExpression(Symbol const& colName, WALEntry const& e
   return ComplexExpression(colName, {}, std::move(colArgs), {});
 }
 
+static Expression buildTableNameExpression(RowBucket const& bucket) {
+  return tableIdToSymbol[bucket.tableId];
+}
+
+static Expression buildRowIdExpression(RowBucket const& bucket) {
+  boss::ExpressionArguments idListArgs;
+  std::visit([&](auto id) { idListArgs.push_back(id); }, bucket.rowId);
+  auto idList = ComplexExpression("List"_, {}, std::move(idListArgs), {});
+
+  boss::ExpressionArguments idColArgs;
+  idColArgs.push_back(std::move(idList));
+
+  if(bucket.idColumnId >= 0) {
+    return ComplexExpression(columnIdToSymbol[bucket.idColumnId], {}, std::move(idColArgs), {});
+  }
+  return ComplexExpression("id"_, {}, std::move(idColArgs), {});
+}
+
+static Expression buildDeleteExpression(RowBucket const& bucket) {
+  boss::ExpressionArguments deleteArgs;
+  deleteArgs.push_back(buildTableNameExpression(bucket));
+  deleteArgs.push_back(buildRowIdExpression(bucket));
+  return ComplexExpression("Delete"_, {}, std::move(deleteArgs), {});
+}
+
+template <typename T>
+static void captureBucketRowIdentity(RowBucket& bucket, T const& idExpression) {
+  auto const* idExpr = asComplexExpressionPtr(idExpression);
+  if(!idExpr) return;
+
+  bucket.idColumnId = internColumnName(idExpr->getHead().getName());
+
+  auto const& idArgs = idExpr->getArguments();
+  if(idArgs.empty()) return;
+
+  auto const& listArg = idArgs[0];
+  auto const* listExpr = get_if<ComplexExpression>(&listArg);
+  if(!listExpr) return;
+
+  auto const& listArgs = listExpr->getArguments();
+  if(listArgs.empty()) return;
+
+  auto const& firstId = listArgs[0];
+  if(auto const* id32 = get_if<int32_t>(&firstId)) {
+    bucket.rowId = *id32;
+  } else if(auto const* id64 = get_if<int64_t>(&firstId)) {
+    bucket.rowId = *id64;
+  }
+}
+
 // ============================================================
 // substituteAndFold — recursive substitution without std::function overhead
 // ============================================================
@@ -861,6 +916,10 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
   auto [bucketIt, inserted] = walIndex.try_emplace(key);
 
   RowBucket& bucket = bucketIt->second;
+  if(inserted) {
+    bucket.tableId = key.first;
+    bucket.rowId = key.second;
+  }
 
   if(auto* entry = get_if<ComplexExpression>(&walEntry)) {
     if(entry->getHead() == "Update"_ && entry->getArguments().size() >= 3) {
@@ -869,9 +928,8 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
       auto [updateHead, updateStatics, updateDynamics, updateSpans] =
         std::move(*entry).decompose();
 
-      if(!bucket.tableName.has_value()) {
-        bucket.tableName = std::move(updateDynamics[0]);
-        bucket.idExpr    = std::move(updateDynamics[1]);
+      if(bucket.idColumnId < 0) {
+        captureBucketRowIdentity(bucket, updateDynamics[1]);
       }
 
       Expression setExpression = std::move(updateDynamics[2]);
@@ -921,9 +979,16 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
     } else if(entry->getHead() == "Delete"_) {
       // Delete gets its own seq — after all column seqs if called after an Update
       // but Delete is captured independently so seq reflects actual arrival order
+      if(bucket.idColumnId < 0 && entry->getArguments().size() >= 2) {
+        auto const& deleteArgs = entry->getArguments();
+        auto const& idArg = deleteArgs[1];
+        visitArgumentByReference(idArg, [&](auto const& unwrapped) {
+          captureBucketRowIdentity(bucket, unwrapped);
+        });
+      }
       int seq = bucket.nextSeq++;
       if(!bucket.deleteEntry.has_value() || seq > bucket.deleteEntry->seq) {
-        bucket.deleteEntry = DeleteEntry{std::move(walEntry), seq};
+        bucket.deleteEntry = DeleteEntry{seq};
       }
       walTotalEntries++;
       #if BOSS_WAL_INSTRUMENTATION
@@ -1186,11 +1251,10 @@ static void optimiseBucketImpl(RowBucket& bucket) {
 // guarantees this, and partitioning it preserves relative order), so no
 // re-sort is needed here.
 static std::optional<Expression> buildUpdateFromResolvedColumns(
-  RowBucket& bucket,
-  std::vector<ResolvedCol>& selected,
-  bool consuming = false)
+  RowBucket const& bucket,
+  std::vector<ResolvedCol>& selected)
 {
-  if(!bucket.tableName.has_value() || !bucket.idExpr.has_value()) {
+  if(bucket.tableId < 0) {
     return std::nullopt;
   }
 
@@ -1208,13 +1272,8 @@ static std::optional<Expression> buildUpdateFromResolvedColumns(
   }
 
   boss::ExpressionArguments updateArgs;
-  if(consuming) {
-    updateArgs.push_back(std::move(*bucket.tableName));
-    updateArgs.push_back(std::move(*bucket.idExpr));
-  } else {
-    updateArgs.push_back(bucket.tableName->clone());
-    updateArgs.push_back(bucket.idExpr->clone());
-  }
+  updateArgs.push_back(buildTableNameExpression(bucket));
+  updateArgs.push_back(buildRowIdExpression(bucket));
   updateArgs.push_back(ComplexExpression("Set"_, {}, std::move(selectedCols), {}));
 
   return ComplexExpression("Update"_, {}, std::move(updateArgs), {});
@@ -1289,7 +1348,7 @@ static std::vector<Expression> flushBucket(
     // ── whole-row flush ───────────────────────────────────────────────────
     // emit Delete first if one exists
     if(bucket.deleteEntry.has_value()) {
-      result.push_back(std::move(bucket.deleteEntry->expr));
+      result.push_back(buildDeleteExpression(bucket));
     }
 
     // Emit pending entries (unfoldable due to multi-occurrence expressions) as
@@ -1302,8 +1361,8 @@ static std::vector<Expression> flushBucket(
         boss::ExpressionArguments setArgs;
         setArgs.push_back(ComplexExpression(rc.columnName, {}, std::move(colArgs), {}));
         boss::ExpressionArguments updateArgs;
-        updateArgs.push_back(bucket.tableName->clone());
-        updateArgs.push_back(bucket.idExpr->clone());
+        updateArgs.push_back(buildTableNameExpression(bucket));
+        updateArgs.push_back(buildRowIdExpression(bucket));
         updateArgs.push_back(ComplexExpression("Set"_, {}, std::move(setArgs), {}));
         result.push_back(ComplexExpression("Update"_, {}, std::move(updateArgs), {}));
       }
@@ -1312,7 +1371,7 @@ static std::vector<Expression> flushBucket(
     // V2P: build the final physical Update directly from the resolved
     // columns — every column is being flushed, so none need to be written
     // into bucket.columnEntries before the bucket is erased below.
-    if(auto update = buildUpdateFromResolvedColumns(bucket, resolution.columns, true)) {
+    if(auto update = buildUpdateFromResolvedColumns(bucket, resolution.columns)) {
       result.push_back(std::move(*update));
     }
 
@@ -1350,8 +1409,8 @@ static std::vector<Expression> flushBucket(
         boss::ExpressionArguments setArgs;
         setArgs.push_back(ComplexExpression(rc.columnName, {}, std::move(colArgs), {}));
         boss::ExpressionArguments updateArgs;
-        updateArgs.push_back(bucket.tableName->clone());
-        updateArgs.push_back(bucket.idExpr->clone());
+        updateArgs.push_back(buildTableNameExpression(bucket));
+        updateArgs.push_back(buildRowIdExpression(bucket));
         updateArgs.push_back(ComplexExpression("Set"_, {}, std::move(setArgs), {}));
         result.push_back(ComplexExpression("Update"_, {}, std::move(updateArgs), {}));
       }
@@ -1723,7 +1782,7 @@ static Expression evaluate(Expression &&e) {
                 allEntries.push_back({e.seq, buildColumnExpression(colSym, e)});
             }
             if(bucket.deleteEntry.has_value())
-              allEntries.push_back({bucket.deleteEntry->seq, bucket.deleteEntry->expr.clone()});
+              allEntries.push_back({bucket.deleteEntry->seq, buildDeleteExpression(bucket)});
 
             // sort by seq to return in arrival order
             std::sort(allEntries.begin(), allEntries.end(),
@@ -1775,6 +1834,7 @@ static Expression evaluate(Expression &&e) {
           walIndex.clear();
           walTotalEntries = 0;
           tableNameIntern.clear();
+          tableIdToSymbol.clear();
           columnNameIntern.clear();
           columnIdToSymbol.clear();
           nextTableId = 0;
