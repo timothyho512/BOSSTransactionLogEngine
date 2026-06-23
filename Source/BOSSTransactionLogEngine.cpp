@@ -417,8 +417,9 @@ static void printWALStats(std::string const& = "") {
 template<typename Callback>
 static void visitRowIDs(ComplexExpression const& idListExpr, Callback callback) {
   // case 1: plain integers
-  for(size_t i = 0; i < idListExpr.getArguments().size(); i++) {
-    auto idVal = idListExpr.getArguments()[i];
+  auto const& args = idListExpr.getArguments();
+  for(size_t i = 0; i < args.size(); i++) {
+    auto const& idVal = args[i];
     if(auto const* id32 = get_if<int32_t>(&idVal)) {
       callback(*id32);
     } else if(auto const* id64 = get_if<int64_t>(&idVal)) {
@@ -1439,15 +1440,16 @@ static std::vector<SelectTarget> extractSelectKeys(ComplexExpression const& expr
   // arg 1 is As(...) containing pairs of (outputName, inputName)
   // we extract the row ID from the inner Select and the column names from As(...)
   if(expr.getHead() == "Project"_) {
-    if(expr.getArguments().size() < 2) return targets;
+    auto const& args = expr.getArguments();
+    if(args.size() < 2) return targets;
 
     // arg 0 must be a Select expression
-    auto innerArg = expr.getArguments()[0];
+    auto const& innerArg = args[0];
     auto const* innerSelect = get_if<ComplexExpression>(&innerArg);
     if(!innerSelect || innerSelect->getHead() != "Select"_) return targets;
 
     // arg 1 must be As(...)
-    auto asArg = expr.getArguments()[1];
+    auto const& asArg = args[1];
     auto const* asExpr = get_if<ComplexExpression>(&asArg);
     if(!asExpr || asExpr->getHead() != "As"_) return targets;
 
@@ -1464,8 +1466,9 @@ static std::vector<SelectTarget> extractSelectKeys(ComplexExpression const& expr
     // e.g. As(FirstName_, FirstName_, LastName_, LastName_)
     // we take every other argument starting at index 1 — the input expressions
     std::vector<std::string> columns;
-    for(size_t i = 1; i < asExpr->getArguments().size(); i += 2) {
-      auto colArg = asExpr->getArguments()[i];
+    auto const& asArgs = asExpr->getArguments();
+    for(size_t i = 1; i < asArgs.size(); i += 2) {
+      auto const& colArg = asArgs[i];
       if(auto const* colSym = get_if<Symbol>(&colArg)) {
         columns.push_back(colSym->getName());
       }
@@ -1482,26 +1485,29 @@ static std::vector<SelectTarget> extractSelectKeys(ComplexExpression const& expr
   //
   // arg 0 is a plain Symbol — the table name
   // arg 1 is Where(...) containing the condition
-  if(expr.getArguments().size() < 1) return targets;
-  auto arg0 = expr.getArguments()[0];
+  auto const& args = expr.getArguments();
+  if(args.size() < 1) return targets;
+  auto const& arg0 = args[0];
   if(auto const* tableSymbol = get_if<boss::Symbol>(&arg0)) {
     std::string tableName = tableSymbol->getName();
     auto tableIt = tableNameIntern.find(tableName);
     if(tableIt == tableNameIntern.end()) return targets; // table not in WAL
 
-    if(expr.getArguments().size() < 2) return targets;
-    auto arg1 = expr.getArguments()[1];
+    if(args.size() < 2) return targets;
+    auto const& arg1 = args[1];
     auto const* whereExpr = get_if<ComplexExpression>(&arg1);
     if(!whereExpr || whereExpr->getHead() != "Where"_) return targets;
 
-    if(whereExpr->getArguments().size() < 1) return targets;
-    auto condArg = whereExpr->getArguments()[0];
+    auto const& whereArgs = whereExpr->getArguments();
+    if(whereArgs.size() < 1) return targets;
+    auto const& condArg = whereArgs[0];
     auto const* condExpr = get_if<ComplexExpression>(&condArg);
     if(!condExpr || condExpr->getHead() != "Equal"_) return targets;
 
-    if(condExpr->getArguments().size() < 2) return targets;
-    auto colArg = condExpr->getArguments()[0];
-    auto valArg = condExpr->getArguments()[1];
+    auto const& condArgs = condExpr->getArguments();
+    if(condArgs.size() < 2) return targets;
+    auto const& colArg = condArgs[0];
+    auto const& valArg = condArgs[1];
 
     auto const* colSymbol = get_if<boss::Symbol>(&colArg);
     if(!colSymbol || colSymbol->getName() != "id") return targets;
@@ -1524,8 +1530,9 @@ static std::vector<SelectTarget> extractSelectKeys(ComplexExpression const& expr
   auto const* tableExpr = get_if<ComplexExpression>(&arg0);
   if(!tableExpr) return targets;
 
-  if(tableExpr->getArguments().size() < 1) return targets;
-  auto nameArg = tableExpr->getArguments()[0];
+  auto const& tableArgs = tableExpr->getArguments();
+  if(tableArgs.size() < 1) return targets;
+  auto const& nameArg = tableArgs[0];
   auto const* nameSymbol = get_if<boss::Symbol>(&nameArg);
   if(!nameSymbol) return targets;
   std::string tableName = nameSymbol->getName();
@@ -1533,12 +1540,14 @@ static std::vector<SelectTarget> extractSelectKeys(ComplexExpression const& expr
   if(tableIt2 == tableNameIntern.end()) return targets; // table not in WAL
   int32_t tableId2 = tableIt2->second;
 
-  for(size_t i = 1; i < tableExpr->getArguments().size(); i++) {
-    auto colArg = tableExpr->getArguments()[i];
+  for(size_t i = 1; i < tableArgs.size(); i++) {
+    auto const& colArg = tableArgs[i];
     auto const* colExpr = get_if<ComplexExpression>(&colArg);
-    if(!colExpr || colExpr->getArguments().size() < 1) continue;
+    if(!colExpr) continue;
 
-    auto listArg = colExpr->getArguments()[0];
+    auto const& colArgs = colExpr->getArguments();
+    if(colArgs.size() < 1) continue;
+    auto const& listArg = colArgs[0];
     auto const* listExpr = get_if<ComplexExpression>(&listArg);
     if(!listExpr) continue;
 
@@ -1574,6 +1583,7 @@ static Expression evaluate(Expression &&e) {
     [](auto &&expr) -> Expression {
       if constexpr(std::is_same_v<std::decay_t<decltype(expr)>, ComplexExpression>) {
         auto head = expr.getHead();
+        auto const& args = expr.getArguments();
 
         // Update - defer to WAL
         if (head == "Update"_) {
@@ -1581,24 +1591,26 @@ static Expression evaluate(Expression &&e) {
           // arg 1 = "Table"_(columns...)
           // arg 2 = "Set"_(column assignments)
           // Extract table name - arg 0
-          auto tableArg = expr.getArguments()[0];
+          auto const& tableArg = args[0];
           auto const* tableSymbol = get_if<Symbol>(&tableArg);
           if(!tableSymbol) return std::move(expr);
 
           // Extract "Table"_ expression
-          auto tableExprArg = expr.getArguments()[1];
+          auto const& tableExprArg = args[1];
           auto const* tableExpr = get_if<ComplexExpression>(&tableExprArg);
           if(!tableExpr) return std::move(expr);
 
           // find the "id"_ column inside Table
           ComplexExpression const* idListExpr = nullptr;
-          auto firstColArg = tableExpr->getArguments()[0];
+          auto const& tableExprArgs = tableExpr->getArguments();
+          auto const& firstColArg = tableExprArgs[0];
           auto const* firstColExpr = get_if<ComplexExpression>(&firstColArg);
           if(!firstColExpr) return std::move(expr);
 
           // use its actual column name for the WAL entry
           auto idColName = firstColExpr->getHead();
-          auto listArg = firstColExpr->getArguments()[0];
+          auto const& firstColArgs = firstColExpr->getArguments();
+          auto const& listArg = firstColArgs[0];
           idListExpr = get_if<ComplexExpression>(&listArg);
           if (!idListExpr) return std::move(expr);
 
@@ -1643,24 +1655,26 @@ static Expression evaluate(Expression &&e) {
           // arg 0 = table name symbol
           // arg 1 = "Table"_(columns...)
 
-          auto tableArg = expr.getArguments()[0];
+          auto const& tableArg = args[0];
           auto const* tableSymbol = get_if<Symbol>(&tableArg);
           if(!tableSymbol) return std::move(expr);
 
-          auto tableExprArg = expr.getArguments()[1];
+          auto const& tableExprArg = args[1];
           auto const* tableExpr = get_if<ComplexExpression>(&tableExprArg);
           if(!tableExpr) return std::move(expr);
 
           // find "id"_ column inside "Table"_
           // which is the first column
           ComplexExpression const* idListExpr = nullptr;
-          auto firstColArg = tableExpr->getArguments()[0];
+          auto const& tableExprArgs = tableExpr->getArguments();
+          auto const& firstColArg = tableExprArgs[0];
           auto const* firstColExpr = get_if<ComplexExpression>(&firstColArg);
           if(!firstColExpr) return std::move(expr);
 
           // use its actual head name for the WAL entry
           auto idColName = firstColExpr->getHead();
-          auto listArg = firstColExpr->getArguments()[0];
+          auto const& firstColArgs = firstColExpr->getArguments();
+          auto const& listArg = firstColArgs[0];
           idListExpr = get_if<ComplexExpression>(&listArg);
           if(!idListExpr) return std::move(expr);
 
@@ -1742,8 +1756,8 @@ static Expression evaluate(Expression &&e) {
         if(head == "PrintWALStats"_) {
           std::string label;
 
-          if(!expr.getArguments().empty()) {
-            auto labelArg = expr.getArguments()[0];
+          if(!args.empty()) {
+            auto const& labelArg = args[0];
 
             if(auto const* s = get_if<std::string>(&labelArg)) {
               label = *s;
@@ -1858,17 +1872,17 @@ static Expression evaluate(Expression &&e) {
         // for flushing the WAL
         if(head == "FlushWAL"_) {
           // FlushWAL() — flush everything
-          if(expr.getArguments().size() == 0) {
+          if(args.size() == 0) {
             return flushAllBuckets(FlushReason::Manual);
           }
 
           // FlushWAL(tableName, rowId) — flush only one specific row
-          if(expr.getArguments().size() == 2) {
-            auto tableArg = expr.getArguments()[0];
+          if(args.size() == 2) {
+            auto const& tableArg = args[0];
             auto const* tableSymbol = get_if<Symbol>(&tableArg);
             if(!tableSymbol) return flushAllBuckets(FlushReason::Manual); // fallback
 
-            auto rowArg = expr.getArguments()[1];
+            auto const& rowArg = args[1];
             int64_t rowId = 0;
             if(auto const* id32 = get_if<int32_t>(&rowArg)) rowId = *id32;
             else if(auto const* id64 = get_if<int64_t>(&rowArg)) rowId = *id64;
