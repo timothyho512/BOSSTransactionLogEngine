@@ -110,6 +110,29 @@ struct DeleteEntry {
   int seq;
 };
 
+using OperationId = uint64_t;
+
+struct WALAssignment {
+  int32_t colId;
+  Expression valueExpr;
+  bool isBlindWrite = false;
+};
+
+struct WALOperation {
+  OperationId opId;
+  int32_t tableId;
+  std::vector<RowID> rowIds;
+  std::vector<WALAssignment> assignments;
+  int seqBase;
+  uint32_t liveRefCount = 0;
+};
+
+struct WALEntryRef {
+  OperationId opId;
+  uint32_t assignmentIndex;
+  int seq;
+};
+
 // SelectTarget — result of parsing a Select or Project(Select(...)) expression
 // key:     (tableName, rowID) — which row to flush
 // columns: which columns to flush — empty means flush all columns (bare Select case)
@@ -187,6 +210,8 @@ struct RowBucket {
 // Fix 2: ankerl::unordered_dense stores entries in a flat contiguous array,
 // eliminating one heap pointer hop per lookup compared to std::unordered_map.
 static ankerl::unordered_dense::map<WALKey, RowBucket, WALKeyHash> walIndex;
+static ankerl::unordered_dense::map<OperationId, WALOperation> walOperations;
+static OperationId nextOperationId = 0;
 
 // total number of entries across all buckets — for threshold check
 static size_t walTotalEntries = 0;
@@ -1832,6 +1857,8 @@ static Expression evaluate(Expression &&e) {
         // ClearWAL - empty the log
         if (head == "ClearWAL"_) {
           walIndex.clear();
+          walOperations.clear();
+          nextOperationId = 0;
           walTotalEntries = 0;
           tableNameIntern.clear();
           tableIdToSymbol.clear();
