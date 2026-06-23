@@ -951,7 +951,20 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
 // row state as it goes — so emitting columns in seq order gives correct results
 // without needing to substitute concrete values here.
 
-static std::optional<Expression> resolveColumnEntries(
+// Result of folding one column's entry list.
+// foldedValue: the combined expression for the entries that were safely folded
+//              (newest entry down to the fold break point, or all entries).
+// pendingEntries: entries that could NOT be safely folded in (oldest first).
+//   These arise when an expression has the column symbol more than once —
+//   folding such an entry would substitute the accumulated expression into
+//   multiple positions, causing exponential tree growth.
+//   Callers must emit these as separate ordered Updates before the merged one.
+struct ColumnFoldResult {
+  std::optional<Expression> foldedValue;
+  std::vector<WALEntry> pendingEntries;
+};
+
+static ColumnFoldResult resolveColumnEntries(
   std::vector<WALEntry>& entries,
   RowBucket const& bucket,
   int cutoffSeq,
@@ -977,6 +990,30 @@ static std::optional<Expression> resolveColumnEntries(
         resolvedValue = std::move(walEntry.valueExpr);
       }
     } else {
+      // Before folding this (older) entry into the accumulated (newer) value,
+      // check if the fold would cause exponential expression growth.
+      //
+      // foldColumnValues substitutes colSym in resolvedValue with walEntry.valueExpr.
+      // If resolvedValue has K occurrences and walEntry has M occurrences, the result
+      // has K*M occurrences. Folding is safe only when both K ≤ 1 and M ≤ 1.
+      //
+      // Blind writes always have 0 occurrences of colSym so they are always safe.
+      if(!walEntry.isBlindWrite) {
+        size_t k = countSymbolOccurrences(*resolvedValue, colSym);
+        size_t m = countSymbolOccurrences(walEntry.valueExpr, colSym);
+        if(k > 1 || m > 1) {
+          // Collect entries 0..idx (oldest first) as pending — they were not moved.
+          std::vector<WALEntry> pending;
+          for(int j = 0; j <= idx; j++) {
+            WALEntry& e = entries[j];
+            if(e.seq > cutoffSeq) continue;
+            if(bucket.deleteEntry.has_value() && e.seq <= bucket.deleteEntry->seq) continue;
+            pending.push_back(std::move(e));
+          }
+          return {std::move(resolvedValue), std::move(pending)};
+        }
+      }
+
       if(walEntry.isBlindWrite) {
         resolvedValue = foldColumnValues(
           colSym,
@@ -994,7 +1031,7 @@ static std::optional<Expression> resolveColumnEntries(
     }
   }
 
-  return resolvedValue;
+  return {std::move(resolvedValue), {}};
 }
 
 // ============================================================
@@ -1017,6 +1054,7 @@ struct ResolvedCol {
   Expression valueExpr;
   int latestSeq;
   bool isBlind;
+  std::vector<WALEntry> pendingEntries; // entries that couldn't be safely folded, oldest first
 };
 
 struct BucketResolution {
@@ -1051,18 +1089,19 @@ static BucketResolution resolveBucketColumns(RowBucket& bucket) {
     int32_t colId = bucket.columnEntries.data[ci].colId;
     auto& entries = bucket.columnEntries.data[ci].entries;
 
-    auto result = resolveColumnEntries(entries, bucket, maxSeq, colId);
-    if(!result.has_value()) continue;
+    auto foldResult = resolveColumnEntries(entries, bucket, maxSeq, colId);
+    if(!foldResult.foldedValue.has_value()) continue;
 
     Symbol const& colSym = columnIdToSymbol[colId];
-    bool blind = isBlindValueWrite(*result);
+    bool blind = isBlindValueWrite(*foldResult.foldedValue);
 
     resolved.push_back({
       colId,
       colSym,
-      std::move(*result),
+      std::move(*foldResult.foldedValue),
       colLatestSeqs[ci],
-      blind
+      blind,
+      std::move(foldResult.pendingEntries)
     });
   }
 
@@ -1111,7 +1150,12 @@ static void optimiseBucketImpl(RowBucket& bucket) {
     auto& colEntries = colPtr->entries;
 
     if(colInserted) {
-      colEntries.reserve(1);
+      colEntries.reserve(1 + rc.pendingEntries.size());
+    }
+
+    // Pending entries (older, could not be safely folded) go back first.
+    for(auto& pe : rc.pendingEntries) {
+      colEntries.push_back(std::move(pe));
     }
 
     // Keep latestSeq so flushBucket can emit columns in dependency-safe order.
@@ -1125,126 +1169,6 @@ static void optimiseBucketImpl(RowBucket& bucket) {
   bucket.nextSeq = resolution.maxSeq + 1;
   // deleteEntry is preserved unchanged — caller decides what to emit
 }
-
-// ============================================================
-// optimiseBucket — apply rules, compact bucket in place
-// ============================================================
-//
-// Resolves the bucket's chain into a compacted set of expressions.
-// Rebuilds chain and columnChain from the resolved results.
-// The bucket stays alive after this call — WAL remains populated.
-//
-// Rules applied:
-//   Rule 1a (blind write):     last-write-wins — earlier writes to same column discarded
-//   Rule 1b (dependent write): fold chain backwards — substitute earlier value into later
-//   Rule 2 (Delete):           all entries before the latest Delete are discarded
-//   Rule 3 (merge columns):    all surviving columns merged into one Update — implicit
-
-// static void optimiseBucketImpl(RowBucket& bucket) {
-//   // find the latest Delete — walk backwards
-//   int deletePos = -1;
-//   for(int i = static_cast<int>(bucket.chain.size()) - 1; i >= 0; i--) {
-//     if(auto const* entry = get_if<ComplexExpression>(&bucket.chain[i])) {
-//       if(entry->getHead() == "Delete"_) {
-//         deletePos = i;
-//         break;
-//       }
-//     }
-//   }
- 
-//   // save the Delete expression NOW before we clear the chain
-//   std::optional<Expression> savedDelete;
-//   if(deletePos >= 0)
-//     savedDelete = bucket.chain[deletePos].clone();
- 
-//   // resolve each column
-//   boss::ExpressionArguments resolvedCols;
-//   ComplexExpression const* representativeEntry = nullptr;
- 
-//   for(auto const& [colName, positions] : bucket.columnChain) {
-//     std::optional<Expression> resolvedValue;
- 
-//     for(int idx = static_cast<int>(positions.size()) - 1; idx >= 0; idx--) {
-//       int pos = positions[idx];
-//       if(pos <= deletePos) break; // Rule 2: before Delete, discard
- 
-//       auto const* entry = get_if<ComplexExpression>(&bucket.chain[pos]);
-//       if(!entry || entry->getArguments().size() < 3) continue;
- 
-//       auto setArg = entry->getArguments()[2];
-//       auto const* setExpr = get_if<ComplexExpression>(&setArg);
-//       if(!setExpr) continue;
- 
-//       ComplexExpression const* colAssign = nullptr;
-//       for(size_t ci = 0; ci < setExpr->getArguments().size(); ci++) {
-//         auto colArg = setExpr->getArguments()[ci];
-//         if(auto const* colExpr = get_if<ComplexExpression>(&colArg)) {
-//           if(colExpr->getHead().getName() == colName) { colAssign = colExpr; break; }
-//         }
-//       }
-//       if(!colAssign) continue;
- 
-//       if(representativeEntry == nullptr) representativeEntry = entry;
- 
-//       if(!resolvedValue.has_value()) {
-//         if(isBlindWrite(*colAssign)) {
-//           resolvedValue = colAssign->clone();
-//           break; // Rule 1a: blind write wins, stop
-//         } else {
-//           resolvedValue = colAssign->clone(); // Rule 1b: dependent, keep walking
-//         }
-//       } else {
-//         auto const* resolvedExpr = get_if<ComplexExpression>(&*resolvedValue);
-//         if(!resolvedExpr) break;
-//         if(isBlindWrite(*colAssign)) {
-//           resolvedValue = foldColumnWrites(*colAssign, *resolvedExpr);
-//           break; // blind base found, stop
-//         } else {
-//           resolvedValue = foldColumnWrites(*colAssign, *resolvedExpr); // keep walking
-//         }
-//       }
-//     }
- 
-//     if(resolvedValue.has_value())
-//       resolvedCols.push_back(std::move(*resolvedValue));
-//   }
-
-//   // save these BEFORE clearing the chain
-//   std::optional<Expression> savedTableName;
-//   std::optional<Expression> savedIdExpr;
-//   if(representativeEntry != nullptr) {
-//     savedTableName = representativeEntry->cloneArgument(0);
-//     savedIdExpr    = representativeEntry->cloneArgument(1);
-//   }
- 
-//   // now clear the bucket — old chain and columnChain are no longer needed
-//   bucket.chain.clear();
-//   bucket.columnChain.clear();
-
-//   // re-add the saved Delete at the end of the compacted chain
-//   if(savedDelete.has_value())
-//     bucket.chain.push_back(std::move(*savedDelete));
- 
-//   // rebuild: one merged Update if any columns survived
-//   if(!resolvedCols.empty() && savedTableName.has_value()) {
-//     boss::ExpressionArguments updateArgs;
-//     updateArgs.push_back(std::move(*savedTableName)); // table name
-//     updateArgs.push_back(std::move(*savedIdExpr)); // id(List(...))
-//     updateArgs.push_back(ComplexExpression("Set"_, {}, std::move(resolvedCols), {}));
-//     auto mergedUpdate = ComplexExpression("Update"_, {}, std::move(updateArgs), {});
- 
-//     // re-register columns in columnChain at position 0
-//     auto setArg = mergedUpdate.getArguments()[2];
-//     if(auto const* setExpr = get_if<ComplexExpression>(&setArg)) {
-//       for(size_t ci = 0; ci < setExpr->getArguments().size(); ci++) {
-//         auto colArg = setExpr->getArguments()[ci];
-//         if(auto const* colExpr = get_if<ComplexExpression>(&colArg))
-//           bucket.columnChain[colExpr->getHead().getName()].push_back(0);
-//       }
-//     }
-//     bucket.chain.push_back(std::move(mergedUpdate));
-//   }
-// }
 
 // ============================================================
 // buildUpdateFromResolvedColumns — assemble Update(...) directly from
@@ -1367,6 +1291,23 @@ static std::vector<Expression> flushBucket(
       result.push_back(std::move(bucket.deleteEntry->expr));
     }
 
+    // Emit pending entries (unfoldable due to multi-occurrence expressions) as
+    // separate ordered Updates BEFORE the merged one. The in-memory engine will
+    // apply them in sequence, then apply the merged folded state last.
+    for(auto& rc : resolution.columns) {
+      for(auto& pe : rc.pendingEntries) {
+        boss::ExpressionArguments colArgs;
+        colArgs.push_back(std::move(pe.valueExpr));
+        boss::ExpressionArguments setArgs;
+        setArgs.push_back(ComplexExpression(rc.columnName, {}, std::move(colArgs), {}));
+        boss::ExpressionArguments updateArgs;
+        updateArgs.push_back(bucket.tableName->clone());
+        updateArgs.push_back(bucket.idExpr->clone());
+        updateArgs.push_back(ComplexExpression("Set"_, {}, std::move(setArgs), {}));
+        result.push_back(ComplexExpression("Update"_, {}, std::move(updateArgs), {}));
+      }
+    }
+
     // V2P: build the final physical Update directly from the resolved
     // columns — every column is being flushed, so none need to be written
     // into bucket.columnEntries before the bucket is erased below.
@@ -1400,6 +1341,21 @@ static std::vector<Expression> flushBucket(
       }
     }
 
+    // Emit pending entries for selected columns before the merged Update.
+    for(auto& rc : selected) {
+      for(auto& pe : rc.pendingEntries) {
+        boss::ExpressionArguments colArgs;
+        colArgs.push_back(std::move(pe.valueExpr));
+        boss::ExpressionArguments setArgs;
+        setArgs.push_back(ComplexExpression(rc.columnName, {}, std::move(colArgs), {}));
+        boss::ExpressionArguments updateArgs;
+        updateArgs.push_back(bucket.tableName->clone());
+        updateArgs.push_back(bucket.idExpr->clone());
+        updateArgs.push_back(ComplexExpression("Set"_, {}, std::move(setArgs), {}));
+        result.push_back(ComplexExpression("Update"_, {}, std::move(updateArgs), {}));
+      }
+    }
+
     // V2P: build the final physical Update directly from the selected
     // columns, without ever writing them into bucket.columnEntries.
     if(auto update = buildUpdateFromResolvedColumns(bucket, selected)) {
@@ -1416,7 +1372,12 @@ static std::vector<Expression> flushBucket(
       auto& colEntries = colPtr->entries;
 
       if(colInserted) {
-        colEntries.reserve(1);
+        colEntries.reserve(1 + rc.pendingEntries.size());
+      }
+
+      // Pending entries (older, could not be safely folded) go back first.
+      for(auto& pe : rc.pendingEntries) {
+        colEntries.push_back(std::move(pe));
       }
 
       colEntries.push_back({
@@ -1428,8 +1389,12 @@ static std::vector<Expression> flushBucket(
     bucket.nextSeq = resolution.maxSeq + 1;
 
     // deleteEntry is guaranteed absent here (forced to flushingAllColumns
-    // above otherwise), so countAfterAll is simply the surviving count.
-    size_t countAfterAll = surviving.size();
+    // above otherwise). Count pending entries for surviving columns too since
+    // they are written back into the bucket.
+    size_t countAfterAll = 0;
+    for(auto const& rc : surviving) {
+      countAfterAll += 1 + rc.pendingEntries.size();
+    }
 
     walTotalEntries -= countBeforeAll;
     walTotalEntries += countAfterAll;
@@ -1603,181 +1568,6 @@ static Expression flushAllBuckets(FlushReason reason = FlushReason::Manual) {
   // std::cout << "WAL: emitting " << entries.size() << " entries" << std::endl;
   return ComplexExpression("ApplyWAL"_, {}, std::move(entries), {});
 }
- 
-// // flushWAL - flush all buckets in insertion order, return ApplyWAL(...)
-// static Expression flushWAL() {
-//   std::cout << "WAL: flushing " << walTotalEntries << " entries across "
-//             << walOrder.size() << " rows" << std::endl;
- 
-//   boss::ExpressionArguments entries;
- 
-//   for(auto const& key : walOrder) {
-//     auto it = walIndex.find(key);
-//     if(it == walIndex.end()) continue;
-//     auto flushed = flushBucket(it->second);
-//     for(auto& e : flushed) {
-//       entries.push_back(std::move(e));
-//     }
-//   }
- 
-//   walIndex.clear();
-//   walOrder.clear();
-//   walTotalEntries = 0;
- 
-//   std::cout << "WAL: " << entries.size() << " entries after optimisation" << std::endl;
-//   return ComplexExpression("ApplyWAL"_, {}, std::move(entries), {});
-// }
-
-// // OptimiseWAL - apply three optimisation rules:
-// // Rule 1: later Update on same row and same column
-// // if later write is blind → earlier is redundant (last-write-wins)
-// // if later write is dependent → fold the two writes together into entry j
-// //   by substituting entry i's value into entry j's expression
-// // 2. Delete eliminates pending Updates on same row
-// // 3. Merge Updates on same row with different columns
-// static void optimiseWAL() {
-//   std::vector<Expression> optimised;
-
-//   for (size_t i = 0; i < writeAheadLog.size(); i++) {
-//     auto const& entryI = get<ComplexExpression>(writeAheadLog[i]);
-//     bool redundant = false;
-
-//     // check if a later entry makes this one redundant
-//     for (size_t j = i + 1; j < writeAheadLog.size(); j++) {
-//       auto const& entryJ = get<ComplexExpression>(writeAheadLog[j]);
-//       if (!sameTableAndRow(entryI, entryJ)) continue;
-
-//       // Rule 2: Delete eliminates any pending Update on same row
-//       if (entryJ.getHead() == "Delete"_) {
-//         redundant = true;
-//         break;
-//       }
-
-//       // Rule 1: later Update on same row and same column
-//       // if later write is blind → earlier is redundant (last-write-wins)
-//       // if later write is dependent → fold the two writes together into entry j
-//       //   by substituting entry i's value into entry j's expression
-//       if(entryI.getHead() == "Update"_ && entryJ.getHead() == "Update"_) {
-//         auto setArgI = entryI.getArguments()[2];
-//         auto const* setExprI = get_if<ComplexExpression>(&setArgI);
-//         if(!setExprI) continue;
-//         auto setArgJ = entryJ.getArguments()[2];
-//         auto const* setExprJ = get_if<ComplexExpression>(&setArgJ);
-//         if(!setExprJ) continue;
-
-//         for(size_t ci = 0; ci < setExprI->getArguments().size(); ci++) {
-//           auto colIArg = setExprI->getArguments()[ci];
-//           auto const* colI = get_if<ComplexExpression>(&colIArg);
-//           if(!colI) continue;
-//           for(size_t cj = 0; cj < setExprJ->getArguments().size(); cj++) {
-//             auto colJArg = setExprJ->getArguments()[cj];
-//             auto const* colJ = get_if<ComplexExpression>(&colJArg);
-//             if(!colJ) continue;
-//             if(colI->getHead() != colJ->getHead()) continue;
-
-//             // same column — check if later write is blind or dependent
-//             if(isBlindWrite(*colJ)) {
-//               // blind write — earlier is simply redundant
-//               redundant = true;
-//             } else {
-//               // dependent write — fold: substitute earlier value into later expression
-//               // modify entry j in the WAL to contain the folded expression
-//               auto& entryJMutable = get<ComplexExpression>(writeAheadLog[j]);
-//               auto [jHead, jStatics, jArgs, jSpans] = std::move(entryJMutable).decompose();
-//               auto setArgJMut = std::move(jArgs[2]);
-//               auto [setHead, setStatics, setArgs, setSpans] = 
-//                 std::move(get<ComplexExpression>(setArgJMut)).decompose();
-
-//               // replace the matching column in entry j's Set with the folded value
-//               for(size_t k = 0; k < setArgs.size(); k++) {
-//                 auto const* setCol = get_if<ComplexExpression>(&setArgs[k]);
-//                 if(!setCol || setCol->getHead() != colI->getHead()) continue;
-//                 setArgs[k] = foldColumnWrites(*colI, *setCol);
-//                 break;
-//               }
-
-//               jArgs[2] = ComplexExpression(setHead, {}, std::move(setArgs), {});
-//               writeAheadLog[j] = ComplexExpression(jHead, {}, std::move(jArgs), {});
-//               redundant = true; // earlier entry is now absorbed into j
-//             }
-//             break;
-//           }
-//           if(redundant) break;
-//         }
-//       }
-//       if(redundant) break;
-//     }
-//     if(!redundant) {
-//       optimised.push_back(entryI.clone());
-//     }
-//   }
-
-//   // Rule 3: merge Updates on same row with different columns
-//   std::vector<Expression> merged;
-//   std::vector<bool> mergedFlag(optimised.size(), false);
-
-//   for (size_t i = 0; i < optimised.size(); i++) {
-//     if(mergedFlag[i]) continue;
-//     auto const& entryI = get<ComplexExpression>(optimised[i]);
-
-//     if(entryI.getHead() != "Update"_) {
-//       merged.push_back(entryI.clone());
-//       continue;
-//     }
-
-
-//     // clone each argument to avoid ArgumentWrapper temporary issue
-//     auto setArgI = entryI.getArguments()[2];
-//     auto const* setExprI = get_if<ComplexExpression>(&setArgI);
-//     boss::ExpressionArguments mergedSetArgs;
-//     for(size_t ci = 0; ci < setExprI->getArguments().size(); ci++) {
-//       mergedSetArgs.push_back(setExprI->cloneArgument(ci));
-//     }
-  
-//     // mergedArgs.push_back(entryI.getArguments()[0]); // table
-//     // mergedArgs.push_back(entryI.getArguments()[1]); // ID
-//     // for(size_t ci = 2; ci < entryI.getArguments().size(); ci++) {
-//     //   mergedArgs.push_back(entryI.getArguments()[ci]);
-//     // }
-
-//     for(size_t j = i + 1; j < optimised.size(); j++) {
-//       if(mergedFlag[j]) continue;
-//       auto const& entryJ = get<ComplexExpression>(optimised[j]);
-//       if(entryJ.getHead() != "Update"_) continue;
-//       if(!sameTableAndRow(entryI, entryJ)) continue;
-
-//       // merge columns from entryJ
-//       auto setArgJ = entryJ.getArguments()[2];
-//       auto const* setExprJ = get_if<ComplexExpression>(&setArgJ);
-//       for(size_t cj = 0; cj < setExprJ->getArguments().size(); cj++) {
-//         mergedSetArgs.push_back(setExprJ->cloneArgument(cj));
-//       }
-//       mergedFlag[j] = true;
-//     }
-//     // build merged WAL entry
-//     boss::ExpressionArguments mergedArgs;
-//     mergedArgs.push_back(entryI.cloneArgument(0)); // table name
-//     mergedArgs.push_back(entryI.cloneArgument(1)); // id
-//     mergedArgs.push_back(ComplexExpression("Set"_, {}, std::move(mergedSetArgs), {}));
-//     merged.push_back(ComplexExpression("Update"_, {}, std::move(mergedArgs), {}));
-//   }
-//   writeAheadLog = std::move(merged);
-// }
-
-// // flushWAL - optimise and return all WAL entries as a List for Arrow storage to apply
-// // called when WAL hit threshold
-// static Expression flushWAL() {
-//   std::cout << "WAL: flushing" << writeAheadLog.size() << " entries" << std::endl;
-//   optimiseWAL();
-//   std::cout << "WAL: " << writeAheadLog.size() << " entries after optimisation" << std::endl;
-
-//   boss::ExpressionArguments entries;
-//   for (auto& entry : writeAheadLog) {
-//     entries.push_back(entry.clone());
-//   }
-//   writeAheadLog.clear();
-//   return ComplexExpression("ApplyWAL"_, {}, std::move(entries), {});
-// }
 
 static Expression evaluate(Expression &&e) {
   return std::visit(
