@@ -11,6 +11,7 @@
 #include <string>
 #include <cstdint>
 #include <functional>
+#include <limits>
 
 #ifndef BOSS_WAL_INSTRUMENTATION
 #define BOSS_WAL_INSTRUMENTATION 1
@@ -121,6 +122,7 @@ struct WALAssignment {
 struct WALOperation {
   OperationId opId;
   int32_t tableId;
+  int32_t idColumnId = -1;
   std::vector<RowID> rowIds;
   std::vector<WALAssignment> assignments;
   int seqBase;
@@ -132,6 +134,8 @@ struct WALEntryRef {
   uint32_t assignmentIndex;
   int seq;
 };
+
+using WALColumnEntry = std::variant<WALEntry, WALEntryRef>;
 
 // SelectTarget — result of parsing a Select or Project(Select(...)) expression
 // key:     (tableName, rowID) — which row to flush
@@ -147,7 +151,7 @@ struct SelectTarget {
 // hops per lookup and keeps the column map entirely on the stack / in-object.
 struct ColEntry {
   int32_t colId = -1;
-  std::vector<WALEntry> entries;
+  std::vector<WALColumnEntry> entries;
 };
 
 struct InlineColVec {
@@ -556,7 +560,7 @@ static std::optional<double> toDouble(Expression const& expr) {
 }
 
 // Read a numeric value from either a raw atom, an Expression, or a BOSS wrapper.
-// This avoids cloneArgument() when tryConstantFold only needs to inspect constants.
+// This avoids materialising argument copies when constant folding only needs to inspect constants.
 template <typename T>
 static std::optional<double> toDoubleValue(T const& value) {
   using Decayed = std::decay_t<T>;
@@ -598,34 +602,6 @@ static ComplexExpression const* asComplexExpressionPtr(T const& value) {
   }
 }
 
-// Create an owned Expression from an existing argument only when rebuilding
-// the simplified expression. This keeps ownership cloning only at output time.
-template <typename T>
-static Expression cloneExpressionValue(T const& value) {
-  using Decayed = std::decay_t<T>;
-
-  if constexpr(boss::utilities::isInstanceOfTemplate<
-                 Decayed, boss::expressions::generic::MovableReferenceWrapper>::value) {
-    return cloneExpressionValue(value.get());
-  } else if constexpr(std::is_same_v<Decayed, Expression>) {
-    return value.clone();
-  } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
-    return value.clone();
-  } else {
-    return value;
-  }
-}
-
-template <typename WrappedArgument>
-static Expression cloneWrappedArgument(WrappedArgument const& wrappedArg) {
-  return std::visit(
-    [](auto const& unwrapped) -> Expression {
-      return cloneExpressionValue(unwrapped);
-    },
-    wrappedArg.getArgument()
-  );
-}
-
 // Visit an argument by reference without cloning.
 // Use this when we only need to inspect an argument, not store it.
 template <typename WrappedArgument, typename Visitor>
@@ -646,28 +622,28 @@ static decltype(auto) visitArgumentByReference(WrappedArgument const& wrappedArg
   );
 }
 
-// Attempt constant folding on a folded expression
+// Attempt constant folding on a folded expression.
 // handles same-operator chains where both constants are concrete numbers
 // e.g. Plus(Plus(price, 1.0), 1.0)   → Plus(price, 2.0)
 // e.g. Times(Times(price, 2.0), 3.0) → Times(price, 6.0)
 // e.g. Minus(Minus(price, 1.0), 2.0) → Minus(price, 3.0)
 // e.g. Divide(Divide(price, 2.0), 2.0) → Divide(price, 4.0)
-// returns nullopt if pattern doesn't match — expression stays as-is
-static std::optional<Expression> tryConstantFold(Expression const& expr) {
+// If the pattern does not match, the original expression is returned unchanged.
+static Expression simplifyConstantFold(Expression expr) {
   auto const* outer = get_if<ComplexExpression>(&expr);
-  if(!outer) return std::nullopt;
+  if(!outer) return expr;
 
   auto const& outerArgs = outer->getArguments();
-  if(outerArgs.size() < 2) return std::nullopt;
+  if(outerArgs.size() < 2) return expr;
 
   auto const& outerHead = outer->getHead();
 
   // only handle our four arithmetic operators
   if(outerHead != "Plus"_  && outerHead != "Minus"_ &&
-     outerHead != "Times"_ && outerHead != "Divide"_) return std::nullopt;
+     outerHead != "Times"_ && outerHead != "Divide"_) return expr;
 
   // outer's first arg must be a ComplexExpression with the SAME operator.
-  // V2E-A: inspect by wrapper/reference instead of cloneArgument(0).
+  // V2E-A: inspect by wrapper/reference instead of materialising argument 0.
   auto const* inner = std::visit(
     [](auto const& unwrapped) -> ComplexExpression const* {
       return asComplexExpressionPtr(unwrapped);
@@ -675,14 +651,14 @@ static std::optional<Expression> tryConstantFold(Expression const& expr) {
     outerArgs[0].getArgument()
   );
 
-  if(!inner) return std::nullopt;
-  if(inner->getHead() != outerHead) return std::nullopt;
+  if(!inner) return expr;
+  if(inner->getHead() != outerHead) return expr;
 
   auto const& innerArgs = inner->getArguments();
-  if(innerArgs.size() < 2) return std::nullopt;
+  if(innerArgs.size() < 2) return expr;
 
   // inner's second arg must be a concrete number (c1).
-  // V2E-A: inspect by wrapper/reference instead of cloneArgument(1).
+  // V2E-A: inspect by wrapper/reference instead of materialising argument 1.
   auto c1 = std::visit(
     [](auto const& unwrapped) -> std::optional<double> {
       return toDoubleValue(unwrapped);
@@ -690,10 +666,10 @@ static std::optional<Expression> tryConstantFold(Expression const& expr) {
     innerArgs[1].getArgument()
   );
 
-  if(!c1) return std::nullopt;
+  if(!c1) return expr;
 
   // outer's second arg must be a concrete number (c2).
-  // V2E-A: inspect by wrapper/reference instead of cloneArgument(1).
+  // V2E-A: inspect by wrapper/reference instead of materialising argument 1.
   auto c2 = std::visit(
     [](auto const& unwrapped) -> std::optional<double> {
       return toDoubleValue(unwrapped);
@@ -701,7 +677,7 @@ static std::optional<Expression> tryConstantFold(Expression const& expr) {
     outerArgs[1].getArgument()
   );
 
-  if(!c2) return std::nullopt;
+  if(!c2) return expr;
 
   // compute the folded constant based on operator
   double folded;
@@ -709,74 +685,92 @@ static std::optional<Expression> tryConstantFold(Expression const& expr) {
   else if(outerHead == "Minus"_)  folded = *c1 + *c2; // Minus(Minus(x,a),b) = Minus(x, a+b)
   else if(outerHead == "Times"_)  folded = *c1 * *c2;
   else if(outerHead == "Divide"_) folded = *c1 * *c2; // Divide(Divide(x,a),b) = Divide(x, a*b)
-  else return std::nullopt;
+  else return expr;
 
-  // Rebuild: outerHead(inner->arg0, folded)
-  // We still need an owned copy of inner arg0 because it becomes part of
-  // the new simplified expression.
+  auto* ownedOuter = get_if<ComplexExpression>(&expr);
+  auto [outerMoveHead, outerStatics, outerDynamics, outerSpans] =
+    std::move(*ownedOuter).decompose();
+  auto* ownedInner = get_if<ComplexExpression>(&outerDynamics[0]);
+  if(!ownedInner) {
+    return expr;
+  }
+  auto [innerMoveHead, innerStatics, innerDynamics, innerSpans] =
+    std::move(*ownedInner).decompose();
+  if(innerDynamics.empty()) {
+    return expr;
+  }
+
+  // Rebuild by moving the operator head and inner->arg0 into the simplified expression.
   boss::ExpressionArguments newArgs;
-  newArgs.push_back(cloneWrappedArgument(innerArgs[0]));
+  newArgs.push_back(std::move(innerDynamics[0]));
   newArgs.push_back(folded);
 
-  return ComplexExpression(outerHead, {}, std::move(newArgs), {});
+  return ComplexExpression(std::move(outerMoveHead), {}, std::move(newArgs), {});
 }
 
-template <typename WrappedArgument>
-static size_t countSymbolOccurrencesArgument(WrappedArgument const& wrappedArg,
-                                             Symbol const& target);
+enum class SymbolUse {
+  Zero,
+  One,
+  Many
+};
 
-static size_t countSymbolOccurrences(Expression const& expr, Symbol const& target);
+template <typename WrappedArgument>
+static SymbolUse classifySymbolUseArgument(WrappedArgument const& wrappedArg,
+                                           Symbol const& target);
+
+static SymbolUse classifySymbolUse(Expression const& expr, Symbol const& target);
+
+static SymbolUse combineSymbolUse(SymbolUse accumulated, SymbolUse next) {
+  if(accumulated == SymbolUse::Many || next == SymbolUse::Many) return SymbolUse::Many;
+  if(accumulated == SymbolUse::One && next == SymbolUse::One) return SymbolUse::Many;
+  if(accumulated == SymbolUse::One || next == SymbolUse::One) return SymbolUse::One;
+  return SymbolUse::Zero;
+}
 
 template <typename T>
-static size_t countSymbolOccurrencesValue(T const& value, Symbol const& target) {
+static SymbolUse classifySymbolUseValue(T const& value, Symbol const& target) {
   using Decayed = std::decay_t<T>;
 
   if constexpr(boss::utilities::isInstanceOfTemplate<
                  Decayed, boss::expressions::generic::MovableReferenceWrapper>::value) {
-    return countSymbolOccurrencesValue(value.get(), target);
+    return classifySymbolUseValue(value.get(), target);
   } else if constexpr(std::is_same_v<Decayed, Symbol>) {
-    return value == target ? 1 : 0;
+    return value == target ? SymbolUse::One : SymbolUse::Zero;
   } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
-    size_t count = 0;
+    SymbolUse use = SymbolUse::Zero;
     auto const& args = value.getArguments();
 
     for(auto const& arg : args) {
-      count += countSymbolOccurrencesArgument(arg, target);
+      use = combineSymbolUse(use, classifySymbolUseArgument(arg, target));
+      if(use == SymbolUse::Many) return SymbolUse::Many;
     }
 
-    return count;
+    return use;
   } else if constexpr(std::is_same_v<Decayed, Expression>) {
-    return countSymbolOccurrences(value, target);
+    return classifySymbolUse(value, target);
   } else {
-    return 0;
+    return SymbolUse::Zero;
   }
 }
 
 template <typename WrappedArgument>
-static size_t countSymbolOccurrencesArgument(WrappedArgument const& wrappedArg,
-                                             Symbol const& target) {
+static SymbolUse classifySymbolUseArgument(WrappedArgument const& wrappedArg,
+                                           Symbol const& target) {
   return visitArgumentByReference(
     wrappedArg,
-    [&](auto const& unwrapped) -> size_t {
-      return countSymbolOccurrencesValue(unwrapped, target);
+    [&](auto const& unwrapped) -> SymbolUse {
+      return classifySymbolUseValue(unwrapped, target);
     }
   );
 }
 
-static size_t countSymbolOccurrences(Expression const& expr, Symbol const& target) {
+static SymbolUse classifySymbolUse(Expression const& expr, Symbol const& target) {
   return std::visit(
-    [&](auto const& value) -> size_t {
-      return countSymbolOccurrencesValue(value, target);
+    [&](auto const& value) -> SymbolUse {
+      return classifySymbolUseValue(value, target);
     },
     expr
   );
-}
-
-static Expression buildColumnExpression(Symbol const& colName, WALEntry const& entry) {
-  boss::ExpressionArguments colArgs;
-  colArgs.push_back(entry.valueExpr.clone());
-
-  return ComplexExpression(colName, {}, std::move(colArgs), {});
 }
 
 static Expression buildTableNameExpression(RowBucket const& bucket) {
@@ -804,6 +798,31 @@ static Expression buildDeleteExpression(RowBucket const& bucket) {
   return ComplexExpression("Delete"_, {}, std::move(deleteArgs), {});
 }
 
+static Expression buildDeleteDebugSummary(RowBucket const& bucket, int seq) {
+  boss::ExpressionArguments args;
+  args.push_back(tableIdToSymbol[bucket.tableId]);
+  std::visit([&](auto rowId) { args.push_back(rowId); }, bucket.rowId);
+  args.push_back(static_cast<int64_t>(seq));
+  return ComplexExpression("WALDelete"_, {}, std::move(args), {});
+}
+
+static Expression buildRowIdExpression(int32_t idColumnId, std::vector<RowID> const& rowIds) {
+  boss::ExpressionArguments idListArgs;
+  idListArgs.reserve(rowIds.size());
+  for(auto const& rowId : rowIds) {
+    std::visit([&](auto id) { idListArgs.push_back(id); }, rowId);
+  }
+  auto idList = ComplexExpression("List"_, {}, std::move(idListArgs), {});
+
+  boss::ExpressionArguments idColArgs;
+  idColArgs.push_back(std::move(idList));
+
+  if(idColumnId >= 0) {
+    return ComplexExpression(columnIdToSymbol[idColumnId], {}, std::move(idColArgs), {});
+  }
+  return ComplexExpression("id"_, {}, std::move(idColArgs), {});
+}
+
 template <typename T>
 static void captureBucketRowIdentity(RowBucket& bucket, T const& idExpression) {
   auto const* idExpr = asComplexExpressionPtr(idExpression);
@@ -829,12 +848,170 @@ static void captureBucketRowIdentity(RowBucket& bucket, T const& idExpression) {
   }
 }
 
+static bool captureAssignmentsFromSet(Expression setExpression, WALOperation& operation) {
+  auto* setExpr = get_if<ComplexExpression>(&setExpression);
+  if(!setExpr || setExpr->getHead() != "Set"_) {
+    return false;
+  }
+
+  auto [setHead, setStatics, setDynamics, setSpans] = std::move(*setExpr).decompose();
+  operation.assignments.reserve(setDynamics.size());
+
+  for(auto& setDynamic : setDynamics) {
+    Expression colExpression = std::move(setDynamic);
+    auto* colExpr = get_if<ComplexExpression>(&colExpression);
+    if(!colExpr) {
+      continue;
+    }
+
+    auto [colHead, colStatics, colDynamics, colSpans] = std::move(*colExpr).decompose();
+    if(colDynamics.empty()) {
+      continue;
+    }
+
+    Expression valueExpr = std::move(colDynamics[0]);
+    bool blind = isBlindValueWrite(valueExpr);
+    operation.assignments.push_back({
+      internColumnName(colHead.getName()),
+      std::move(valueExpr),
+      blind
+    });
+  }
+
+  return !operation.assignments.empty();
+}
+
+static WALEntry consumeColumnEntryRef(WALEntryRef const& ref) {
+  auto opIt = walOperations.find(ref.opId);
+  if(opIt == walOperations.end() || ref.assignmentIndex >= opIt->second.assignments.size()) {
+    return {int32_t{0}, ref.seq, true};
+  }
+
+  WALAssignment& assignment = opIt->second.assignments[ref.assignmentIndex];
+  WALEntry entry{
+    std::move(assignment.valueExpr),
+    ref.seq,
+    assignment.isBlindWrite
+  };
+  walOperations.erase(opIt);
+  return entry;
+}
+
+static void discardColumnEntryRef(WALEntryRef const& ref) {
+  walOperations.erase(ref.opId);
+}
+
+static std::optional<Expression> buildUpdateFromOperation(WALOperation& operation) {
+  if(operation.tableId < 0 || operation.assignments.empty() || operation.rowIds.empty()) {
+    return std::nullopt;
+  }
+
+  boss::ExpressionArguments setArgs;
+  setArgs.reserve(operation.assignments.size());
+  for(auto& assignment : operation.assignments) {
+    boss::ExpressionArguments colArgs;
+    colArgs.push_back(std::move(assignment.valueExpr));
+    setArgs.push_back(
+      ComplexExpression(columnIdToSymbol[assignment.colId], {}, std::move(colArgs), {}));
+  }
+
+  boss::ExpressionArguments updateArgs;
+  updateArgs.push_back(tableIdToSymbol[operation.tableId]);
+  updateArgs.push_back(buildRowIdExpression(operation.idColumnId, operation.rowIds));
+  updateArgs.push_back(ComplexExpression("Set"_, {}, std::move(setArgs), {}));
+
+  return ComplexExpression("Update"_, {}, std::move(updateArgs), {});
+}
+
+static Expression buildOperationDebugSummary(WALOperation const& operation) {
+  boss::ExpressionArguments args;
+  args.push_back(static_cast<int64_t>(operation.opId));
+  args.push_back(tableIdToSymbol[operation.tableId]);
+  args.push_back(static_cast<int64_t>(operation.rowIds.size()));
+  args.push_back(static_cast<int64_t>(operation.assignments.size()));
+  return ComplexExpression("WALOperation"_, {}, std::move(args), {});
+}
+
+static Expression buildRefDebugSummary(RowBucket const& bucket, int32_t colId, WALEntryRef const& ref) {
+  boss::ExpressionArguments args;
+  args.push_back(static_cast<int64_t>(ref.opId));
+  args.push_back(tableIdToSymbol[bucket.tableId]);
+  std::visit([&](auto rowId) { args.push_back(rowId); }, bucket.rowId);
+  args.push_back(columnIdToSymbol[colId]);
+  args.push_back(static_cast<int64_t>(ref.seq));
+
+  auto opIt = walOperations.find(ref.opId);
+  bool isBlind = false;
+  if(opIt != walOperations.end() && ref.assignmentIndex < opIt->second.assignments.size()) {
+    isBlind = opIt->second.assignments[ref.assignmentIndex].isBlindWrite;
+  }
+  args.push_back(isBlind ? "blind"s : "dependent"s);
+
+  return ComplexExpression("WALRef"_, {}, std::move(args), {});
+}
+
+static Expression buildLocalDebugSummary(RowBucket const& bucket, int32_t colId, WALEntry const& entry) {
+  boss::ExpressionArguments args;
+  args.push_back(static_cast<int64_t>(-1));
+  args.push_back(tableIdToSymbol[bucket.tableId]);
+  std::visit([&](auto rowId) { args.push_back(rowId); }, bucket.rowId);
+  args.push_back(columnIdToSymbol[colId]);
+  args.push_back(static_cast<int64_t>(entry.seq));
+  args.push_back(entry.isBlindWrite ? "blind"s : "dependent"s);
+
+  return ComplexExpression("WALRef"_, {}, std::move(args), {});
+}
+
+static bool isSharedOperationRef(WALEntryRef const& ref) {
+  auto opIt = walOperations.find(ref.opId);
+  return opIt != walOperations.end() && opIt->second.rowIds.size() > 1;
+}
+
+static int getColumnEntrySeq(WALColumnEntry const& entry) {
+  return std::visit([](auto const& e) { return e.seq; }, entry);
+}
+
+static WALEntryRef const* getColumnEntryRef(WALColumnEntry const& entry) {
+  return std::get_if<WALEntryRef>(&entry);
+}
+
+static bool isSharedOperationEntry(WALColumnEntry const& entry) {
+  auto const* ref = getColumnEntryRef(entry);
+  return ref && isSharedOperationRef(*ref);
+}
+
+static bool isBlindSharedAssignment(OperationId opId, int32_t colId) {
+  auto opIt = walOperations.find(opId);
+  if(opIt == walOperations.end() || opIt->second.rowIds.size() <= 1) {
+    return false;
+  }
+
+  for(auto const& assignment : opIt->second.assignments) {
+    if(assignment.colId == colId) {
+      return assignment.isBlindWrite;
+    }
+  }
+  return false;
+}
+
+static bool bucketHasPendingWork(RowBucket const& bucket) {
+  if(bucket.deleteEntry.has_value()) {
+    return true;
+  }
+  for(auto const& col : bucket.columnEntries) {
+    if(!col.entries.empty()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // ============================================================
 // substituteAndFold — recursive substitution without std::function overhead
 // ============================================================
 //
 // Replaces all occurrences of colName with replacement inside expr,
-// applying tryConstantFold after rebuilding each ComplexExpression node (V2M).
+// applying constant folding after rebuilding each ComplexExpression node (V2M).
 //
 // V2O: foldColumnValues previously used a std::function<Expression(Expression
 // const&)> for mutual recursion between two lambdas (substituteExpr and
@@ -846,62 +1023,58 @@ static void captureBucketRowIdentity(RowBucket& bucket, T const& idExpression) {
 // visitArgumentByReference already gives us the concrete unwrapped type, so
 // substituteAndFoldValue can dispatch on it directly via if constexpr.
 
-static Expression substituteAndFold(Expression const& expr,
+static Expression substituteAndFold(Expression expr,
                                     Symbol const& colName,
                                     Expression& replacement,
-                                    bool canMove,
                                     bool& moved);
 
 template <typename T>
-static Expression substituteAndFoldValue(T const& value,
+static Expression substituteAndFoldValue(T&& value,
                                           Symbol const& colName,
                                           Expression& replacement,
-                                          bool canMove,
                                           bool& moved)
 {
   using Decayed = std::decay_t<T>;
 
   if constexpr(std::is_same_v<Decayed, Symbol>) {
     if(value == colName) {
-      if(canMove && !moved) { moved = true; return std::move(replacement); }
-      return replacement.clone();
+      if(!moved) {
+        moved = true;
+        return std::move(replacement);
+      }
     }
     return value;
   } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
+    auto [head, statics, dynamics, spans] = std::move(value).decompose();
     boss::ExpressionArguments newArgs;
-    auto const& args = value.getArguments();
-    newArgs.reserve(args.size());
-    for(auto const& arg : args) {
-      newArgs.push_back(visitArgumentByReference(arg, [&](auto const& inner) -> Expression {
-        return substituteAndFoldValue(inner, colName, replacement, canMove, moved);
-      }));
+    newArgs.reserve(dynamics.size());
+    for(auto& arg : dynamics) {
+      newArgs.push_back(substituteAndFold(std::move(arg), colName, replacement, moved));
     }
-    Expression rebuilt = ComplexExpression(value.getHead(), {}, std::move(newArgs), {});
+    Expression rebuilt = ComplexExpression(head, {}, std::move(newArgs), {});
 
     // V2M: apply constant folding immediately during recursive substitution.
-    if(auto simplified = tryConstantFold(rebuilt)) return std::move(*simplified);
-    return rebuilt;
+    return simplifyConstantFold(std::move(rebuilt));
   } else if constexpr(std::is_same_v<Decayed, Expression>) {
-    return substituteAndFold(value, colName, replacement, canMove, moved);
+    return substituteAndFold(std::move(value), colName, replacement, moved);
   } else {
     return value;
   }
 }
 
-static Expression substituteAndFold(Expression const& expr,
+static Expression substituteAndFold(Expression expr,
                                     Symbol const& colName,
                                     Expression& replacement,
-                                    bool canMove,
                                     bool& moved)
 {
-  return std::visit([&](auto const& value) -> Expression {
-    return substituteAndFoldValue(value, colName, replacement, canMove, moved);
+  return std::visit([&](auto& value) -> Expression {
+    return substituteAndFoldValue(std::move(value), colName, replacement, moved);
   }, expr);
 }
 
-static Expression foldColumnValues(Symbol const& colName,
-                                   Expression earlierValueExpr,
-                                   Expression const& laterValueExpr) {
+static std::optional<Expression> foldColumnValues(Symbol const& colName,
+                                                  Expression earlierValueExpr,
+                                                  Expression laterValueExpr) {
   // earlierValueExpr = Plus(price, 1)
   // laterValueExpr   = Plus(price, 1)
   //
@@ -909,20 +1082,21 @@ static Expression foldColumnValues(Symbol const& colName,
   // substitute price in laterValueExpr with earlierValueExpr
   // => Plus(Plus(price, 1), 1)
 
-  size_t replacementCount = countSymbolOccurrences(laterValueExpr, colName);
+  SymbolUse replacementUse = classifySymbolUse(laterValueExpr, colName);
+  if(replacementUse == SymbolUse::Zero) {
+    return std::move(laterValueExpr);
+  }
 
-  bool canMoveEarlierValue = replacementCount == 1;
+  if(replacementUse == SymbolUse::Many) {
+    return std::nullopt;
+  }
   bool earlierValueMoved = false;
 
   Expression foldedValue = substituteAndFold(
-    laterValueExpr, colName, earlierValueExpr, canMoveEarlierValue, earlierValueMoved);
+    std::move(laterValueExpr), colName, earlierValueExpr, earlierValueMoved);
 
   // top-level constant fold (inner nodes already folded by substituteAndFoldValue)
-  if(auto simplified = tryConstantFold(foldedValue)) {
-    return std::move(*simplified);
-  }
-
-  return foldedValue;
+  return simplifyConstantFold(std::move(foldedValue));
 }
 
 // ============================================================
@@ -989,7 +1163,7 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
               colEntries.reserve(WAL_COLUMN_ENTRY_RESERVE);
             }
 
-            colEntries.push_back({
+            colEntries.push_back(WALEntry{
               std::move(valueExpr),
               seq,
               blind
@@ -1056,7 +1230,7 @@ struct ColumnFoldResult {
 };
 
 static ColumnFoldResult resolveColumnEntries(
-  std::vector<WALEntry>& entries,
+  std::vector<WALEntry> entries,
   RowBucket const& bucket,
   int cutoffSeq,
   int32_t colId)
@@ -1088,41 +1262,347 @@ static ColumnFoldResult resolveColumnEntries(
       // If resolvedValue has K occurrences and walEntry has M occurrences, the result
       // has K*M occurrences. Folding is safe only when both K ≤ 1 and M ≤ 1.
       //
-      // Blind writes always have 0 occurrences of colSym so they are always safe.
-      if(!walEntry.isBlindWrite) {
-        size_t k = countSymbolOccurrences(*resolvedValue, colSym);
-        size_t m = countSymbolOccurrences(walEntry.valueExpr, colSym);
-        if(k > 1 || m > 1) {
-          // Collect entries 0..idx (oldest first) as pending — they were not moved.
-          std::vector<WALEntry> pending;
-          for(int j = 0; j <= idx; j++) {
-            WALEntry& e = entries[j];
-            if(e.seq > cutoffSeq) continue;
-            if(bucket.deleteEntry.has_value() && e.seq <= bucket.deleteEntry->seq) continue;
-            pending.push_back(std::move(e));
-          }
-          return {std::move(resolvedValue), std::move(pending)};
+      // Blind writes have 0 occurrences of colSym, but the accumulated newer
+      // expression can still be a multi-use boundary such as Plus(price, price).
+      SymbolUse k = classifySymbolUse(*resolvedValue, colSym);
+      SymbolUse m = walEntry.isBlindWrite ? SymbolUse::Zero
+                                          : classifySymbolUse(walEntry.valueExpr, colSym);
+      if(k == SymbolUse::Many || m == SymbolUse::Many) {
+        // Collect entries 0..idx (oldest first) as pending — they were not moved.
+        std::vector<WALEntry> pending;
+        for(int j = 0; j <= idx; j++) {
+          WALEntry& e = entries[j];
+          if(e.seq > cutoffSeq) continue;
+          if(bucket.deleteEntry.has_value() && e.seq <= bucket.deleteEntry->seq) continue;
+          pending.push_back(std::move(e));
         }
+        return {std::move(resolvedValue), std::move(pending)};
       }
 
       if(walEntry.isBlindWrite) {
-        resolvedValue = foldColumnValues(
+        auto folded = foldColumnValues(
           colSym,
           std::move(walEntry.valueExpr),
-          *resolvedValue
+          std::move(*resolvedValue)
         );
+        if(!folded.has_value()) return {std::move(resolvedValue), {}};
+        resolvedValue = std::move(*folded);
         break;
       } else {
-        resolvedValue = foldColumnValues(
+        auto folded = foldColumnValues(
           colSym,
           std::move(walEntry.valueExpr),
-          *resolvedValue
+          std::move(*resolvedValue)
         );
+        if(!folded.has_value()) return {std::move(resolvedValue), {}};
+        resolvedValue = std::move(*folded);
       }
     }
   }
 
   return {std::move(resolvedValue), {}};
+}
+
+static ColumnFoldResult resolveColumnEntries(
+  std::vector<WALColumnEntry>& columnEntries,
+  RowBucket const& bucket,
+  int cutoffSeq,
+  int32_t colId)
+{
+  std::vector<WALEntry> entries;
+  entries.reserve(columnEntries.size());
+  for(auto& entry : columnEntries) {
+    if(auto* local = std::get_if<WALEntry>(&entry)) {
+      entries.push_back(std::move(*local));
+    } else if(auto const* ref = std::get_if<WALEntryRef>(&entry)) {
+      entries.push_back(consumeColumnEntryRef(*ref));
+    }
+  }
+
+  return resolveColumnEntries(std::move(entries), bucket, cutoffSeq, colId);
+}
+
+static std::optional<Expression> buildSingleColumnUpdate(RowBucket const& bucket,
+                                                         int32_t colId,
+                                                         Expression valueExpr) {
+  if(bucket.tableId < 0) {
+    return std::nullopt;
+  }
+
+  boss::ExpressionArguments colArgs;
+  colArgs.push_back(std::move(valueExpr));
+
+  boss::ExpressionArguments setArgs;
+  setArgs.push_back(
+    ComplexExpression(columnIdToSymbol[colId], {}, std::move(colArgs), {}));
+
+  boss::ExpressionArguments updateArgs;
+  updateArgs.push_back(buildTableNameExpression(bucket));
+  updateArgs.push_back(buildRowIdExpression(bucket));
+  updateArgs.push_back(ComplexExpression("Set"_, {}, std::move(setArgs), {}));
+
+  return ComplexExpression("Update"_, {}, std::move(updateArgs), {});
+}
+
+static std::vector<Expression> materialiseLocalEntries(RowBucket const& bucket,
+                                                       int32_t colId,
+                                                       std::vector<WALEntry> entries);
+
+static std::vector<Expression> materialiseLocalRefSegment(RowBucket const& bucket,
+                                                          int32_t colId,
+                                                          std::vector<WALEntry> entries) {
+  std::vector<Expression> result;
+  if(entries.empty()) {
+    return result;
+  }
+
+  auto foldResult = resolveColumnEntries(
+    std::move(entries), bucket, std::numeric_limits<int>::max(), colId);
+
+  if(!foldResult.pendingEntries.empty()) {
+    auto pendingUpdates = materialiseLocalRefSegment(
+      bucket, colId, std::move(foldResult.pendingEntries));
+    for(auto& update : pendingUpdates) {
+      result.push_back(std::move(update));
+    }
+  }
+
+  if(foldResult.foldedValue.has_value()) {
+    if(auto update = buildSingleColumnUpdate(bucket, colId, std::move(*foldResult.foldedValue))) {
+      result.push_back(std::move(*update));
+    }
+  }
+
+  return result;
+}
+
+static std::vector<Expression> materialiseLocalEntries(RowBucket const& bucket,
+                                                       int32_t colId,
+                                                       std::vector<WALEntry> entries) {
+  return materialiseLocalRefSegment(bucket, colId, std::move(entries));
+}
+
+static std::vector<Expression> materialiseLocalRefSegment(RowBucket const& bucket,
+                                                          int32_t colId,
+                                                          std::vector<WALColumnEntry> columnEntries) {
+  std::vector<WALEntry> entries;
+  entries.reserve(columnEntries.size());
+  for(auto& entry : columnEntries) {
+    if(auto* local = std::get_if<WALEntry>(&entry)) {
+      entries.push_back(std::move(*local));
+    } else if(auto const* ref = std::get_if<WALEntryRef>(&entry)) {
+      entries.push_back(consumeColumnEntryRef(*ref));
+    }
+  }
+
+  return materialiseLocalRefSegment(bucket, colId, std::move(entries));
+}
+
+static void discardLocalRefSegment(std::vector<WALColumnEntry> const& entries) {
+  for(auto const& entry : entries) {
+    if(auto const* ref = std::get_if<WALEntryRef>(&entry)) {
+      discardColumnEntryRef(*ref);
+    }
+  }
+}
+
+enum class LocalSegmentMode {
+  Emit,
+  Discard
+};
+
+static std::vector<Expression> materialiseColumnChainUntil(
+  WALKey const& key,
+  int32_t colId,
+  std::optional<OperationId> stopBeforeOp,
+  LocalSegmentMode localMode);
+
+static void removeOperationRefsFromTouchedColumns(OperationId opId,
+                                                  std::vector<RowID> const& rowIds,
+                                                  std::vector<int32_t> const& colIds,
+                                                  int32_t tableId) {
+  for(auto const& rowId : rowIds) {
+    WALKey key{tableId, toInt64(rowId)};
+    auto bucketIt = walIndex.find(key);
+    if(bucketIt == walIndex.end()) {
+      continue;
+    }
+
+    for(int32_t colId : colIds) {
+      auto* col = bucketIt->second.columnEntries.find(colId);
+      if(!col) {
+        continue;
+      }
+
+      auto& entries = col->entries;
+      entries.erase(
+        std::remove_if(entries.begin(), entries.end(),
+          [&](WALColumnEntry const& entry) {
+            auto const* ref = std::get_if<WALEntryRef>(&entry);
+            return ref && ref->opId == opId;
+          }),
+        entries.end());
+    }
+  }
+}
+
+static std::vector<Expression> materialiseSharedBoundary(OperationId opId) {
+  std::vector<Expression> result;
+  auto opIt = walOperations.find(opId);
+  if(opIt == walOperations.end()) {
+    return result;
+  }
+
+  int32_t tableId = opIt->second.tableId;
+  std::vector<RowID> rowIds = opIt->second.rowIds;
+  std::vector<int32_t> colIds;
+  std::vector<bool> assignmentBlindness;
+  colIds.reserve(opIt->second.assignments.size());
+  assignmentBlindness.reserve(opIt->second.assignments.size());
+  for(auto const& assignment : opIt->second.assignments) {
+    colIds.push_back(assignment.colId);
+    assignmentBlindness.push_back(assignment.isBlindWrite);
+  }
+  size_t liveRefCount = opIt->second.liveRefCount;
+
+  for(auto const& rowId : rowIds) {
+    WALKey key{tableId, toInt64(rowId)};
+    for(size_t ai = 0; ai < colIds.size(); ++ai) {
+      auto prefixMode = assignmentBlindness[ai]
+        ? LocalSegmentMode::Discard
+        : LocalSegmentMode::Emit;
+      auto prefix = materialiseColumnChainUntil(key, colIds[ai], opId, prefixMode);
+      for(auto& update : prefix) {
+        result.push_back(std::move(update));
+      }
+    }
+  }
+
+  opIt = walOperations.find(opId);
+  if(opIt == walOperations.end()) {
+    return result;
+  }
+
+  if(auto update = buildUpdateFromOperation(opIt->second)) {
+    result.push_back(std::move(*update));
+  }
+
+  if(walTotalEntries >= liveRefCount) {
+    walTotalEntries -= liveRefCount;
+  } else {
+    walTotalEntries = 0;
+  }
+
+  removeOperationRefsFromTouchedColumns(opId, rowIds, colIds, tableId);
+  walOperations.erase(opId);
+
+  return result;
+}
+
+static std::vector<Expression> materialiseColumnChainUntil(
+  WALKey const& key,
+  int32_t colId,
+  std::optional<OperationId> stopBeforeOp,
+  LocalSegmentMode localMode)
+{
+  std::vector<Expression> result;
+
+  while(true) {
+    auto bucketIt = walIndex.find(key);
+    if(bucketIt == walIndex.end()) {
+      return result;
+    }
+
+    RowBucket& bucket = bucketIt->second;
+    auto* col = bucket.columnEntries.find(colId);
+    if(!col || col->entries.empty()) {
+      return result;
+    }
+
+    auto& entries = col->entries;
+    size_t boundaryIndex = entries.size();
+    std::optional<OperationId> boundaryOp;
+
+    for(size_t i = 0; i < entries.size(); ++i) {
+      auto const* ref = std::get_if<WALEntryRef>(&entries[i]);
+      if(stopBeforeOp.has_value() && ref && ref->opId == *stopBeforeOp) {
+        boundaryIndex = i;
+        boundaryOp = std::nullopt;
+        break;
+      }
+      if(ref && isSharedOperationRef(*ref)) {
+        boundaryIndex = i;
+        boundaryOp = ref->opId;
+        break;
+      }
+    }
+
+    std::vector<WALColumnEntry> segment(
+      std::make_move_iterator(entries.begin()),
+      std::make_move_iterator(entries.begin() + boundaryIndex));
+    size_t segmentSize = segment.size();
+    if(!segment.empty()) {
+      auto effectiveLocalMode = localMode;
+      if(boundaryOp.has_value() && isBlindSharedAssignment(*boundaryOp, colId)) {
+        effectiveLocalMode = LocalSegmentMode::Discard;
+      }
+
+      if(effectiveLocalMode == LocalSegmentMode::Emit) {
+        auto localUpdates = materialiseLocalRefSegment(bucket, colId, std::move(segment));
+        for(auto& update : localUpdates) {
+          result.push_back(std::move(update));
+        }
+      } else {
+        discardLocalRefSegment(segment);
+      }
+
+      if(walTotalEntries >= segmentSize) {
+        walTotalEntries -= segmentSize;
+      } else {
+        walTotalEntries = 0;
+      }
+      entries.erase(entries.begin(), entries.begin() + boundaryIndex);
+    }
+
+    if(stopBeforeOp.has_value()) {
+      auto const* frontRef = entries.empty()
+        ? nullptr
+        : std::get_if<WALEntryRef>(&entries.front());
+      if(frontRef && frontRef->opId == *stopBeforeOp) {
+        return result;
+      }
+      continue;
+    }
+
+    if(boundaryOp.has_value()) {
+      auto sharedUpdates = materialiseSharedBoundary(*boundaryOp);
+      for(auto& update : sharedUpdates) {
+        result.push_back(std::move(update));
+      }
+      continue;
+    }
+
+    return result;
+  }
+}
+
+static bool selectedColumnsContainSharedRefs(RowBucket const& bucket,
+                                             std::vector<std::string> const& columns) {
+  for(auto const& col : bucket.columnEntries) {
+    if(!columns.empty()) {
+      Symbol const& colSym = columnIdToSymbol[col.colId];
+      if(std::find(columns.begin(), columns.end(), colSym.getName()) == columns.end()) {
+        continue;
+      }
+    }
+
+    for(auto const& entry : col.entries) {
+      if(isSharedOperationEntry(entry)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 // ============================================================
@@ -1165,9 +1645,10 @@ static BucketResolution resolveBucketColumns(RowBucket& bucket) {
 
   for(int ci = 0; ci < bucket.columnEntries.size; ++ci) {
     for(auto const& e : bucket.columnEntries.data[ci].entries) {
-      if(e.seq > deleteSeq) {
-        if(e.seq > maxSeq) maxSeq = e.seq;
-        if(e.seq > colLatestSeqs[ci]) colLatestSeqs[ci] = e.seq;
+      int seq = getColumnEntrySeq(e);
+      if(seq > deleteSeq) {
+        if(seq > maxSeq) maxSeq = seq;
+        if(seq > colLatestSeqs[ci]) colLatestSeqs[ci] = seq;
       }
     }
   }
@@ -1175,7 +1656,14 @@ static BucketResolution resolveBucketColumns(RowBucket& bucket) {
   std::vector<ResolvedCol> resolved;
 
   for(int ci = 0; ci < bucket.columnEntries.size; ++ci) {
-    if(colLatestSeqs[ci] == -1) continue; // all entries before delete, skip
+    if(colLatestSeqs[ci] == -1) {
+      for(auto const& entry : bucket.columnEntries.data[ci].entries) {
+        if(auto const* ref = std::get_if<WALEntryRef>(&entry)) {
+          discardColumnEntryRef(*ref);
+        }
+      }
+      continue; // all entries before delete, skip
+    }
 
     int32_t colId = bucket.columnEntries.data[ci].colId;
     auto& entries = bucket.columnEntries.data[ci].entries;
@@ -1246,11 +1734,15 @@ static void optimiseBucketImpl(RowBucket& bucket) {
 
     // Pending entries (older, could not be safely folded) go back first.
     for(auto& pe : rc.pendingEntries) {
-      colEntries.push_back(std::move(pe));
+      colEntries.push_back(WALEntry{
+        std::move(pe.valueExpr),
+        pe.seq,
+        pe.isBlindWrite
+      });
     }
 
     // Keep latestSeq so flushBucket can emit columns in dependency-safe order.
-    colEntries.push_back({
+    colEntries.push_back(WALEntry{
       std::move(rc.valueExpr),
       rc.latestSeq,
       rc.isBlind
@@ -1317,6 +1809,7 @@ static std::vector<Expression> flushBucket(
   if(it == walIndex.end()) return {};
 
   RowBucket& bucket = it->second;
+  std::vector<Expression> result;
 
   // If a row-level Delete is pending, a column-selective flush is not safe.
   // A Delete affects the whole row, so force this to become a whole-row flush.
@@ -1356,6 +1849,45 @@ static std::vector<Expression> flushBucket(
 
   recordFlushStart(reason, countBeforeFlushed);
 
+  if(selectedColumnsContainSharedRefs(bucket, effectiveColumns)) {
+    std::vector<int32_t> colIdsToFlush;
+    if(flushingAllColumns) {
+      colIdsToFlush.reserve(bucket.columnEntries.size);
+      for(auto const& col : bucket.columnEntries) {
+        colIdsToFlush.push_back(col.colId);
+      }
+    } else {
+      for(auto const& colName : effectiveColumns) {
+        auto nameIt = columnNameIntern.find(colName);
+        if(nameIt == columnNameIntern.end()) continue;
+        if(bucket.columnEntries.find(nameIt->second)) {
+          colIdsToFlush.push_back(nameIt->second);
+        }
+      }
+    }
+
+    for(int32_t colId : colIdsToFlush) {
+      auto columnUpdates = materialiseColumnChainUntil(key, colId, std::nullopt, LocalSegmentMode::Emit);
+      for(auto& update : columnUpdates) {
+        result.push_back(std::move(update));
+      }
+    }
+
+    if(bucket.deleteEntry.has_value() && flushingAllColumns) {
+      result.push_back(buildDeleteExpression(bucket));
+      if(walTotalEntries > 0) {
+        walTotalEntries--;
+      }
+    }
+
+    if(flushingAllColumns || !bucketHasPendingWork(bucket)) {
+      walIndex.erase(it);
+    }
+
+    recordPhysicalExpressions(result);
+    return result;
+  }
+
   // V2P: resolve all columns once, without writing the result back into
   // bucket.columnEntries yet. Previously optimiseBucketImpl() wrote every
   // resolved column into the map unconditionally, even though:
@@ -1366,8 +1898,6 @@ static std::vector<Expression> flushBucket(
   // Only columns that need to remain in the bucket afterward are persisted
   // below; columns being flushed now go straight from resolution to output.
   auto resolution = resolveBucketColumns(bucket);
-
-  std::vector<Expression> result;
 
   if(flushingAllColumns) {
     // ── whole-row flush ───────────────────────────────────────────────────
@@ -1380,16 +1910,12 @@ static std::vector<Expression> flushBucket(
     // separate ordered Updates BEFORE the merged one. The in-memory engine will
     // apply them in sequence, then apply the merged folded state last.
     for(auto& rc : resolution.columns) {
-      for(auto& pe : rc.pendingEntries) {
-        boss::ExpressionArguments colArgs;
-        colArgs.push_back(std::move(pe.valueExpr));
-        boss::ExpressionArguments setArgs;
-        setArgs.push_back(ComplexExpression(rc.columnName, {}, std::move(colArgs), {}));
-        boss::ExpressionArguments updateArgs;
-        updateArgs.push_back(buildTableNameExpression(bucket));
-        updateArgs.push_back(buildRowIdExpression(bucket));
-        updateArgs.push_back(ComplexExpression("Set"_, {}, std::move(setArgs), {}));
-        result.push_back(ComplexExpression("Update"_, {}, std::move(updateArgs), {}));
+      if(!rc.pendingEntries.empty()) {
+        auto pendingUpdates = materialiseLocalEntries(
+          bucket, rc.colId, std::move(rc.pendingEntries));
+        for(auto& update : pendingUpdates) {
+          result.push_back(std::move(update));
+        }
       }
     }
 
@@ -1428,16 +1954,12 @@ static std::vector<Expression> flushBucket(
 
     // Emit pending entries for selected columns before the merged Update.
     for(auto& rc : selected) {
-      for(auto& pe : rc.pendingEntries) {
-        boss::ExpressionArguments colArgs;
-        colArgs.push_back(std::move(pe.valueExpr));
-        boss::ExpressionArguments setArgs;
-        setArgs.push_back(ComplexExpression(rc.columnName, {}, std::move(colArgs), {}));
-        boss::ExpressionArguments updateArgs;
-        updateArgs.push_back(buildTableNameExpression(bucket));
-        updateArgs.push_back(buildRowIdExpression(bucket));
-        updateArgs.push_back(ComplexExpression("Set"_, {}, std::move(setArgs), {}));
-        result.push_back(ComplexExpression("Update"_, {}, std::move(updateArgs), {}));
+      if(!rc.pendingEntries.empty()) {
+        auto pendingUpdates = materialiseLocalEntries(
+          bucket, rc.colId, std::move(rc.pendingEntries));
+        for(auto& update : pendingUpdates) {
+          result.push_back(std::move(update));
+        }
       }
     }
 
@@ -1462,10 +1984,14 @@ static std::vector<Expression> flushBucket(
 
       // Pending entries (older, could not be safely folded) go back first.
       for(auto& pe : rc.pendingEntries) {
-        colEntries.push_back(std::move(pe));
+        colEntries.push_back(WALEntry{
+          std::move(pe.valueExpr),
+          pe.seq,
+          pe.isBlindWrite
+        });
       }
 
-      colEntries.push_back({
+      colEntries.push_back(WALEntry{
         std::move(rc.valueExpr),
         rc.latestSeq,
         rc.isBlind
@@ -1662,6 +2188,71 @@ static Expression flushAllBuckets(FlushReason reason = FlushReason::Manual) {
   return ComplexExpression("ApplyWAL"_, {}, std::move(entries), {});
 }
 
+static bool captureMultiRowUpdateOperation(
+  int32_t tableId,
+  int32_t idColumnId,
+  std::vector<RowID> rowIds,
+  Expression setExpression,
+  boss::ExpressionArguments& prefixFlushes)
+{
+  if(rowIds.size() <= 1) {
+    return false;
+  }
+
+  WALOperation operation{
+    nextOperationId++,
+    tableId,
+    idColumnId,
+    std::move(rowIds),
+    {},
+    0,
+    0
+  };
+
+  if(!captureAssignmentsFromSet(std::move(setExpression), operation)) {
+    return false;
+  }
+
+  OperationId opId = operation.opId;
+  size_t assignmentCount = operation.assignments.size();
+  operation.liveRefCount = static_cast<uint32_t>(operation.rowIds.size() * assignmentCount);
+
+  for(auto const& rowId : operation.rowIds) {
+    WALKey key{tableId, toInt64(rowId)};
+    auto [bucketIt, inserted] = walIndex.try_emplace(key);
+    RowBucket& bucket = bucketIt->second;
+    if(inserted) {
+      bucket.tableId = key.first;
+      bucket.rowId = rowId;
+    }
+    bucket.idColumnId = idColumnId;
+    int seq = bucket.nextSeq++;
+    if(operation.seqBase == 0) {
+      operation.seqBase = seq;
+    }
+
+    for(uint32_t assignmentIndex = 0;
+        assignmentIndex < static_cast<uint32_t>(operation.assignments.size());
+        ++assignmentIndex) {
+      int32_t colId = operation.assignments[assignmentIndex].colId;
+      auto [colPtr, colInserted] = bucket.columnEntries.try_emplace(colId);
+      if(!colPtr) continue;
+      if(colInserted) {
+        colPtr->entries.reserve(WAL_COLUMN_ENTRY_RESERVE);
+      }
+      colPtr->entries.push_back(WALEntryRef{opId, assignmentIndex, seq});
+    }
+  }
+
+  walTotalEntries += operation.rowIds.size() * assignmentCount;
+  #if BOSS_WAL_INSTRUMENTATION
+  walStats.walEntriesCreated += operation.rowIds.size() * assignmentCount;
+  #endif
+
+  walOperations.emplace(opId, std::move(operation));
+  return true;
+}
+
 static Expression evaluate(Expression &&e) {
   return std::visit(
     [](auto &&expr) -> Expression {
@@ -1675,51 +2266,76 @@ static Expression evaluate(Expression &&e) {
           // arg 1 = "Table"_(columns...)
           // arg 2 = "Set"_(column assignments)
           // Extract table name - arg 0
-          auto const& tableArg = args[0];
+          auto tableArg = expr.getArguments()[0];
           auto const* tableSymbol = get_if<Symbol>(&tableArg);
           if(!tableSymbol) return std::move(expr);
 
           // Extract "Table"_ expression
-          auto const& tableExprArg = args[1];
+          auto tableExprArg = expr.getArguments()[1];
           auto const* tableExpr = get_if<ComplexExpression>(&tableExprArg);
           if(!tableExpr) return std::move(expr);
 
           // find the "id"_ column inside Table
           ComplexExpression const* idListExpr = nullptr;
-          auto const& tableExprArgs = tableExpr->getArguments();
-          auto const& firstColArg = tableExprArgs[0];
+          auto firstColArg = tableExpr->getArguments()[0];
           auto const* firstColExpr = get_if<ComplexExpression>(&firstColArg);
           if(!firstColExpr) return std::move(expr);
 
           // use its actual column name for the WAL entry
           auto idColName = firstColExpr->getHead();
-          auto const& firstColArgs = firstColExpr->getArguments();
-          auto const& listArg = firstColArgs[0];
+          auto listArg = firstColExpr->getArguments()[0];
           idListExpr = get_if<ComplexExpression>(&listArg);
           if (!idListExpr) return std::move(expr);
 
-          // Extract the "Set"_ expression — setArg is already an owned copy
-          auto setArg = expr.getArguments()[2];
-          if(!get_if<ComplexExpression>(&setArg)) return std::move(expr);
+          auto const& setArgRef = args[2];
+          bool setArgIsValid = visitArgumentByReference(setArgRef, [](auto const& unwrapped) {
+            auto const* setExpr = asComplexExpressionPtr(unwrapped);
+            return setExpr && setExpr->getHead() == "Set"_;
+          });
+          if(!setArgIsValid) return std::move(expr);
 
-          // Collect row IDs before consuming setArg so we know when the last
-          // iteration is and can move instead of clone on that final push.
           std::vector<RowID> rowIds;
           visitRowIDs(*idListExpr, [&](auto idValue) { rowIds.push_back(idValue); });
+          if(rowIds.empty()) return "Update_Logged"_();
 
           int32_t tableId = internTableName(tableSymbol->getName());
-          for(size_t i = 0; i < rowIds.size(); ++i) {
-            bool isLast = (i + 1 == rowIds.size());
-            WALKey key{tableId, toInt64(rowIds[i])};
+          int32_t idColumnId = internColumnName(idColName.getName());
+          Symbol tableNameSymbol = *tableSymbol;
+          Symbol idColNameSymbol = idColName;
+
+          auto [updateHead, updateStatics, updateDynamics, updateSpans] =
+            std::move(expr).decompose();
+          Expression setArg = std::move(updateDynamics[2]);
+
+          if(rowIds.size() > 1) {
+            boss::ExpressionArguments prefixFlushes;
+            if(!captureMultiRowUpdateOperation(
+                 tableId, idColumnId, std::move(rowIds), std::move(setArg), prefixFlushes)) {
+              return "Update_Ignored"_();
+            }
+
+            if(walTotalEntries >= WAL_THRESHOLD && prefixFlushes.empty()) {
+              return flushAllBuckets(FlushReason::ChainThreshold);
+            }
+
+            if(!prefixFlushes.empty()) {
+              return ComplexExpression("ApplyWAL"_, {}, std::move(prefixFlushes), {});
+            }
+
+            return "Update_Logged"_();
+          }
+
+          WALKey key{tableId, toInt64(rowIds[0])};
+          {
             boss::ExpressionArguments walArgs;
-            walArgs.push_back(*tableSymbol);
+            walArgs.push_back(tableNameSymbol);
             boss::ExpressionArguments idListArgs;
-            std::visit([&](auto id) { idListArgs.push_back(id); }, rowIds[i]);
+            std::visit([&](auto id) { idListArgs.push_back(id); }, rowIds[0]);
             auto idList = ComplexExpression("List"_, {}, std::move(idListArgs), {});
             boss::ExpressionArguments idColArgs;
             idColArgs.push_back(std::move(idList));
-            walArgs.push_back(ComplexExpression(idColName, {}, std::move(idColArgs), {}));
-            walArgs.push_back(isLast ? std::move(setArg) : setArg.clone());
+            walArgs.push_back(ComplexExpression(idColNameSymbol, {}, std::move(idColArgs), {}));
+            walArgs.push_back(std::move(setArg));
             walIndexPush(key, ComplexExpression("Update"_, {}, std::move(walArgs), {}));
           }
 
@@ -1794,20 +2410,50 @@ static Expression evaluate(Expression &&e) {
           return "Delete_Logged"_();
         }
 
-        // GetWAL — return raw chain contents flattened in seq order
+        // GetWAL — return non-consuming metadata summaries flattened in seq order
         if (head == "GetWAL"_) {
           boss::ExpressionArguments entries;
+          std::vector<OperationId> seenOperations;
           for(auto const& [key, bucket] : walIndex) {
 
             // collect all entries across columns with their seq numbers
             std::vector<std::pair<int, Expression>> allEntries;
             for(auto const& col : bucket.columnEntries) {
-              Symbol const& colSym = columnIdToSymbol[col.colId];
-              for(auto const& e : col.entries)
-                allEntries.push_back({e.seq, buildColumnExpression(colSym, e)});
+              for(auto const& e : col.entries) {
+                if(auto const* local = std::get_if<WALEntry>(&e)) {
+                  allEntries.push_back({
+                    local->seq,
+                    buildLocalDebugSummary(bucket, col.colId, *local)
+                  });
+                  continue;
+                }
+
+                auto const* ref = std::get_if<WALEntryRef>(&e);
+                if(!ref) {
+                  continue;
+                }
+
+                if(isSharedOperationRef(*ref)) {
+                  if(std::find(seenOperations.begin(), seenOperations.end(), ref->opId)
+                       != seenOperations.end()) {
+                    continue;
+                  }
+                  auto opIt = walOperations.find(ref->opId);
+                  if(opIt == walOperations.end()) {
+                    continue;
+                  }
+                  seenOperations.push_back(ref->opId);
+                  allEntries.push_back({ref->seq, buildOperationDebugSummary(opIt->second)});
+                  continue;
+                }
+                allEntries.push_back({ref->seq, buildRefDebugSummary(bucket, col.colId, *ref)});
+              }
             }
             if(bucket.deleteEntry.has_value())
-              allEntries.push_back({bucket.deleteEntry->seq, buildDeleteExpression(bucket)});
+              allEntries.push_back({
+                bucket.deleteEntry->seq,
+                buildDeleteDebugSummary(bucket, bucket.deleteEntry->seq)
+              });
 
             // sort by seq to return in arrival order
             std::sort(allEntries.begin(), allEntries.end(),
@@ -1873,6 +2519,10 @@ static Expression evaluate(Expression &&e) {
           // commented out for better testing output
           // std::cout << "WAL: optimising " << walTotalEntries << " entries" << std::endl;
           for(auto& [key, bucket] : walIndex) {
+            if(selectedColumnsContainSharedRefs(bucket, {})) {
+              continue;
+            }
+
             // count entries before optimise
             size_t countBefore = 0;
             for(auto const& col : bucket.columnEntries) countBefore += col.entries.size();
