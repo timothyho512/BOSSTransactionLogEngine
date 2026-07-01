@@ -105,6 +105,7 @@ struct WALEntry {
   Expression valueExpr;
   int seq;
   bool isBlindWrite = false;
+  std::vector<int32_t> referencedCols;
 };
 
 struct DeleteEntry {
@@ -117,6 +118,7 @@ struct WALAssignment {
   int32_t colId;
   Expression valueExpr;
   bool isBlindWrite = false;
+  std::vector<int32_t> referencedCols;
 };
 
 struct WALOperation {
@@ -136,6 +138,16 @@ struct WALEntryRef {
 };
 
 using WALColumnEntry = std::variant<WALEntry, WALEntryRef>;
+
+struct EntryHandle {
+  int32_t colId;
+  int seq;
+};
+
+struct ReverseDepList {
+  int32_t referencedColId = -1;
+  std::vector<EntryHandle> readers;
+};
 
 // SelectTarget — result of parsing a Select or Project(Select(...)) expression
 // key:     (tableName, rowID) — which row to flush
@@ -208,6 +220,10 @@ struct RowBucket {
 
   // monotonically increasing counter across columns
   int nextSeq = 0;
+
+  // Same-row cross-column dependency metadata.
+  // referenced column id -> pending entries in this row that read that column.
+  std::vector<ReverseDepList> reverseDeps;
 };
  
 // the WAL index: (tableName, rowID) → bucket
@@ -549,6 +565,8 @@ static bool isBlindWrite(ComplexExpression const& colAssign) {
   return !containsSymbolArgument(args[0]);
 }
 
+static std::vector<int32_t> collectReferencedColumnIds(Expression const& expr);
+
 // Helper to extract a double from any numeric Expression
 // returns nullopt if not a numeric concrete value
 static std::optional<double> toDouble(Expression const& expr) {
@@ -871,10 +889,12 @@ static bool captureAssignmentsFromSet(Expression setExpression, WALOperation& op
 
     Expression valueExpr = std::move(colDynamics[0]);
     bool blind = isBlindValueWrite(valueExpr);
+    auto referencedCols = collectReferencedColumnIds(valueExpr);
     operation.assignments.push_back({
       internColumnName(colHead.getName()),
       std::move(valueExpr),
-      blind
+      blind,
+      std::move(referencedCols)
     });
   }
 
@@ -891,7 +911,8 @@ static WALEntry consumeColumnEntryRef(WALEntryRef const& ref) {
   WALEntry entry{
     std::move(assignment.valueExpr),
     ref.seq,
-    assignment.isBlindWrite
+    assignment.isBlindWrite,
+    std::move(assignment.referencedCols)
   };
   walOperations.erase(opIt);
   return entry;
@@ -969,6 +990,115 @@ static bool isSharedOperationRef(WALEntryRef const& ref) {
 
 static int getColumnEntrySeq(WALColumnEntry const& entry) {
   return std::visit([](auto const& e) { return e.seq; }, entry);
+}
+
+static void addUniqueColumnId(std::vector<int32_t>& ids, int32_t colId) {
+  if(std::find(ids.begin(), ids.end(), colId) == ids.end()) {
+    ids.push_back(colId);
+  }
+}
+
+template <typename T>
+static void collectReferencedColumnIdsValue(T const& value, std::vector<int32_t>& out);
+
+template <typename WrappedArgument>
+static void collectReferencedColumnIdsArgument(WrappedArgument const& wrappedArg,
+                                               std::vector<int32_t>& out) {
+  visitArgumentByReference(
+    wrappedArg,
+    [&](auto const& unwrapped) {
+      collectReferencedColumnIdsValue(unwrapped, out);
+    }
+  );
+}
+
+static std::vector<int32_t> collectReferencedColumnIds(Expression const& expr);
+
+template <typename T>
+static void collectReferencedColumnIdsValue(T const& value, std::vector<int32_t>& out) {
+  using Decayed = std::decay_t<T>;
+
+  if constexpr(boss::utilities::isInstanceOfTemplate<
+                 Decayed, boss::expressions::generic::MovableReferenceWrapper>::value) {
+    collectReferencedColumnIdsValue(value.get(), out);
+  } else if constexpr(std::is_same_v<Decayed, Symbol>) {
+    addUniqueColumnId(out, internColumnName(value.getName()));
+  } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
+    for(auto const& arg : value.getArguments()) {
+      collectReferencedColumnIdsArgument(arg, out);
+    }
+  } else if constexpr(std::is_same_v<Decayed, Expression>) {
+    auto nested = collectReferencedColumnIds(value);
+    for(int32_t colId : nested) {
+      addUniqueColumnId(out, colId);
+    }
+  }
+}
+
+static std::vector<int32_t> collectReferencedColumnIds(Expression const& expr) {
+  std::vector<int32_t> referenced;
+  std::visit(
+    [&](auto const& value) {
+      collectReferencedColumnIdsValue(value, referenced);
+    },
+    expr
+  );
+  return referenced;
+}
+
+static void registerReverseDependency(RowBucket& bucket,
+                                      int32_t referencedColId,
+                                      EntryHandle reader) {
+  auto it = std::find_if(
+    bucket.reverseDeps.begin(),
+    bucket.reverseDeps.end(),
+    [&](ReverseDepList const& dep) {
+      return dep.referencedColId == referencedColId;
+    });
+
+  if(it == bucket.reverseDeps.end()) {
+    bucket.reverseDeps.push_back(ReverseDepList{referencedColId, {}});
+    it = std::prev(bucket.reverseDeps.end());
+  }
+
+  auto exists = std::find_if(
+    it->readers.begin(),
+    it->readers.end(),
+    [&](EntryHandle const& existing) {
+      return existing.colId == reader.colId && existing.seq == reader.seq;
+    });
+  if(exists == it->readers.end()) {
+    it->readers.push_back(reader);
+  }
+}
+
+static void registerReverseDependencies(RowBucket& bucket,
+                                        int32_t readerColId,
+                                        int seq,
+                                        std::vector<int32_t> const& referencedCols) {
+  for(int32_t referencedColId : referencedCols) {
+    registerReverseDependency(bucket, referencedColId, EntryHandle{readerColId, seq});
+  }
+}
+
+static void rebuildReverseDependencies(RowBucket& bucket) {
+  bucket.reverseDeps.clear();
+
+  for(auto const& col : bucket.columnEntries) {
+    for(auto const& entry : col.entries) {
+      if(auto const* local = std::get_if<WALEntry>(&entry)) {
+        registerReverseDependencies(bucket, col.colId, local->seq, local->referencedCols);
+      } else if(auto const* ref = std::get_if<WALEntryRef>(&entry)) {
+        auto opIt = walOperations.find(ref->opId);
+        if(opIt == walOperations.end() ||
+           ref->assignmentIndex >= opIt->second.assignments.size()) {
+          continue;
+        }
+        auto const& assignment = opIt->second.assignments[ref->assignmentIndex];
+        registerReverseDependencies(bucket, col.colId, ref->seq, assignment.referencedCols);
+      }
+    }
+  }
 }
 
 static WALEntryRef const* getColumnEntryRef(WALColumnEntry const& entry) {
@@ -1152,6 +1282,7 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
             Expression valueExpr = std::move(colDynamics[0]);
 
             bool blind = isBlindValueWrite(valueExpr);
+            auto referencedCols = collectReferencedColumnIds(valueExpr);
 
             int seq = bucket.nextSeq++;
 
@@ -1166,8 +1297,10 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
             colEntries.push_back(WALEntry{
               std::move(valueExpr),
               seq,
-              blind
+              blind,
+              referencedCols
             });
+            registerReverseDependencies(bucket, colId, seq, referencedCols);
             walTotalEntries++; // once per column, not once per Update
             #if BOSS_WAL_INSTRUMENTATION
             walStats.walEntriesCreated++;
@@ -1605,6 +1738,339 @@ static bool selectedColumnsContainSharedRefs(RowBucket const& bucket,
   return false;
 }
 
+static bool bucketContainsSharedRefs(RowBucket const& bucket) {
+  return selectedColumnsContainSharedRefs(bucket, {});
+}
+
+static WALEntry const* findLocalEntry(RowBucket const& bucket, int32_t colId, int seq) {
+  auto const* col = bucket.columnEntries.find(colId);
+  if(!col) {
+    return nullptr;
+  }
+
+  for(auto const& entry : col->entries) {
+    auto const* local = std::get_if<WALEntry>(&entry);
+    if(local && local->seq == seq) {
+      return local;
+    }
+  }
+  return nullptr;
+}
+
+static WALEntry* findLocalEntry(RowBucket& bucket, int32_t colId, int seq) {
+  auto* col = bucket.columnEntries.find(colId);
+  if(!col) {
+    return nullptr;
+  }
+
+  for(auto& entry : col->entries) {
+    auto* local = std::get_if<WALEntry>(&entry);
+    if(local && local->seq == seq) {
+      return local;
+    }
+  }
+  return nullptr;
+}
+
+static std::optional<int> latestLocalSeq(RowBucket const& bucket, int32_t colId) {
+  auto const* col = bucket.columnEntries.find(colId);
+  if(!col) {
+    return std::nullopt;
+  }
+
+  std::optional<int> latest;
+  for(auto const& entry : col->entries) {
+    if(auto const* local = std::get_if<WALEntry>(&entry)) {
+      if(!latest.has_value() || local->seq > *latest) {
+        latest = local->seq;
+      }
+    }
+  }
+  return latest;
+}
+
+static std::optional<int> latestLocalSeqBefore(RowBucket const& bucket,
+                                               int32_t colId,
+                                               int beforeSeq) {
+  auto const* col = bucket.columnEntries.find(colId);
+  if(!col) {
+    return std::nullopt;
+  }
+
+  std::optional<int> latest;
+  for(auto const& entry : col->entries) {
+    if(auto const* local = std::get_if<WALEntry>(&entry)) {
+      if(local->seq < beforeSeq && (!latest.has_value() || local->seq > *latest)) {
+        latest = local->seq;
+      }
+    }
+  }
+  return latest;
+}
+
+static bool overwritesOwnColumn(WALEntry const& entry, int32_t colId) {
+  Symbol const& colSym = columnIdToSymbol[colId];
+  return classifySymbolUse(entry.valueExpr, colSym) == SymbolUse::Zero;
+}
+
+static std::vector<EntryHandle> collectRelevantEntriesForColumnCutoff(
+  RowBucket const& bucket,
+  int32_t colId,
+  int cutoffSeq)
+{
+  std::vector<EntryHandle> relevant;
+  auto const* col = bucket.columnEntries.find(colId);
+  if(!col) {
+    return relevant;
+  }
+
+  for(auto it = col->entries.rbegin(); it != col->entries.rend(); ++it) {
+    auto const* local = std::get_if<WALEntry>(&*it);
+    if(!local) {
+      continue;
+    }
+
+    if(local->seq > cutoffSeq) {
+      continue;
+    }
+
+    if(bucket.deleteEntry.has_value() && local->seq <= bucket.deleteEntry->seq) {
+      break;
+    }
+
+    relevant.push_back(EntryHandle{colId, local->seq});
+
+    if(overwritesOwnColumn(*local, colId)) {
+      break;
+    }
+  }
+
+  std::reverse(relevant.begin(), relevant.end());
+  return relevant;
+}
+
+static bool containsEntryHandle(std::vector<EntryHandle> const& handles,
+                                EntryHandle needle) {
+  return std::find_if(
+    handles.begin(),
+    handles.end(),
+    [&](EntryHandle const& handle) {
+      return handle.colId == needle.colId && handle.seq == needle.seq;
+    }) != handles.end();
+}
+
+static bool isRelevantReaderBefore(RowBucket const& bucket,
+                                   EntryHandle reader,
+                                   int beforeSeq) {
+  auto relevant = collectRelevantEntriesForColumnCutoff(
+    bucket, reader.colId, beforeSeq - 1);
+  return containsEntryHandle(relevant, reader);
+}
+
+static std::vector<EntryHandle> readersOfColumnBefore(RowBucket const& bucket,
+                                                       int32_t referencedColId,
+                                                       int beforeSeq) {
+  std::vector<EntryHandle> readers;
+  auto it = std::find_if(
+    bucket.reverseDeps.begin(),
+    bucket.reverseDeps.end(),
+    [&](ReverseDepList const& dep) {
+      return dep.referencedColId == referencedColId;
+    });
+  if(it == bucket.reverseDeps.end()) {
+    return readers;
+  }
+
+  for(auto const& reader : it->readers) {
+    if(reader.colId == referencedColId || reader.seq >= beforeSeq) {
+      continue;
+    }
+    if(findLocalEntry(bucket, reader.colId, reader.seq) &&
+       isRelevantReaderBefore(bucket, reader, beforeSeq)) {
+      readers.push_back(reader);
+    }
+  }
+
+  std::sort(readers.begin(), readers.end(),
+    [](EntryHandle const& a, EntryHandle const& b) {
+      return a.seq < b.seq;
+    });
+  return readers;
+}
+
+struct PlannedEntry {
+  int32_t colId;
+  int seq;
+};
+
+struct MaterialisationPlan {
+  std::vector<PlannedEntry> entries;
+};
+
+static bool planContains(MaterialisationPlan const& plan, int32_t colId, int seq) {
+  return std::find_if(
+    plan.entries.begin(),
+    plan.entries.end(),
+    [&](PlannedEntry const& entry) {
+      return entry.colId == colId && entry.seq == seq;
+    }) != plan.entries.end();
+}
+
+static void planColumnPrefix(RowBucket const& bucket,
+                             int32_t colId,
+                             int cutoffSeq,
+                             MaterialisationPlan& plan);
+
+static void planEntry(RowBucket const& bucket,
+                      int32_t colId,
+                      int seq,
+                      MaterialisationPlan& plan) {
+  if(planContains(plan, colId, seq)) {
+    return;
+  }
+
+  auto const* entry = findLocalEntry(bucket, colId, seq);
+  if(!entry) {
+    return;
+  }
+
+  plan.entries.push_back(PlannedEntry{colId, seq});
+
+  for(int32_t depColId : entry->referencedCols) {
+    if(depColId == colId) {
+      continue;
+    }
+
+    auto depSeq = latestLocalSeqBefore(bucket, depColId, seq);
+    if(depSeq.has_value()) {
+      planColumnPrefix(bucket, depColId, *depSeq, plan);
+    }
+  }
+
+  for(auto const& reader : readersOfColumnBefore(bucket, colId, seq)) {
+    planEntry(bucket, reader.colId, reader.seq, plan);
+  }
+}
+
+static void planColumnPrefix(RowBucket const& bucket,
+                             int32_t colId,
+                             int cutoffSeq,
+                             MaterialisationPlan& plan) {
+  auto relevantEntries = collectRelevantEntriesForColumnCutoff(bucket, colId, cutoffSeq);
+  for(auto const& handle : relevantEntries) {
+    planEntry(bucket, handle.colId, handle.seq, plan);
+  }
+}
+
+static MaterialisationPlan buildSameRowDependencyPlan(
+  RowBucket const& bucket,
+  std::vector<std::string> const& requestedColumns) {
+  MaterialisationPlan plan;
+
+  for(auto const& name : requestedColumns) {
+    auto nameIt = columnNameIntern.find(name);
+    if(nameIt == columnNameIntern.end()) {
+      continue;
+    }
+
+    auto latestSeq = latestLocalSeq(bucket, nameIt->second);
+    if(latestSeq.has_value()) {
+      planColumnPrefix(bucket, nameIt->second, *latestSeq, plan);
+    }
+  }
+
+  std::sort(plan.entries.begin(), plan.entries.end(),
+    [](PlannedEntry const& a, PlannedEntry const& b) {
+      return a.seq < b.seq;
+    });
+  return plan;
+}
+
+static bool entryHasCrossColumnDependency(WALEntry const& entry, int32_t colId) {
+  return std::any_of(
+    entry.referencedCols.begin(),
+    entry.referencedCols.end(),
+    [&](int32_t referencedColId) {
+      return referencedColId != colId;
+    });
+}
+
+static bool selectionNeedsDependencyPath(RowBucket const& bucket,
+                                         std::vector<std::string> const& columns) {
+  if(columns.empty() || bucketContainsSharedRefs(bucket)) {
+    return false;
+  }
+
+  for(auto const& name : columns) {
+    auto nameIt = columnNameIntern.find(name);
+    if(nameIt == columnNameIntern.end()) {
+      continue;
+    }
+
+    int32_t colId = nameIt->second;
+    auto latestSeq = latestLocalSeq(bucket, colId);
+    if(!latestSeq.has_value()) {
+      continue;
+    }
+
+    auto relevantEntries = collectRelevantEntriesForColumnCutoff(bucket, colId, *latestSeq);
+    for(auto const& handle : relevantEntries) {
+      auto const* entry = findLocalEntry(bucket, handle.colId, handle.seq);
+      if(entry && entryHasCrossColumnDependency(*entry, colId)) {
+        return true;
+      }
+    }
+
+    if(!readersOfColumnBefore(bucket, colId, *latestSeq).empty()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static std::vector<Expression> materialiseDependencyPlan(RowBucket& bucket,
+                                                         MaterialisationPlan const& plan,
+                                                         size_t& materialisedEntries) {
+  std::vector<Expression> result;
+  materialisedEntries = 0;
+
+  for(auto const& planned : plan.entries) {
+    auto* entry = findLocalEntry(bucket, planned.colId, planned.seq);
+    if(!entry) {
+      continue;
+    }
+
+    if(auto update = buildSingleColumnUpdate(
+         bucket, planned.colId, std::move(entry->valueExpr))) {
+      result.push_back(std::move(*update));
+      materialisedEntries++;
+    }
+  }
+
+  for(auto& col : bucket.columnEntries) {
+    auto& entries = col.entries;
+    entries.erase(
+      std::remove_if(entries.begin(), entries.end(),
+        [&](WALColumnEntry const& columnEntry) {
+          auto const* local = std::get_if<WALEntry>(&columnEntry);
+          if(!local) {
+            return false;
+          }
+          return std::find_if(
+            plan.entries.begin(),
+            plan.entries.end(),
+            [&](PlannedEntry const& planned) {
+              return planned.colId == col.colId && planned.seq == local->seq;
+            }) != plan.entries.end();
+        }),
+      entries.end());
+  }
+
+  rebuildReverseDependencies(bucket);
+  return result;
+}
+
 // ============================================================
 // ResolvedCol / resolveBucketColumns — read-only column resolution
 // ============================================================
@@ -1737,19 +2203,23 @@ static void optimiseBucketImpl(RowBucket& bucket) {
       colEntries.push_back(WALEntry{
         std::move(pe.valueExpr),
         pe.seq,
-        pe.isBlindWrite
+        pe.isBlindWrite,
+        std::move(pe.referencedCols)
       });
     }
 
     // Keep latestSeq so flushBucket can emit columns in dependency-safe order.
+    auto referencedCols = collectReferencedColumnIds(rc.valueExpr);
     colEntries.push_back(WALEntry{
       std::move(rc.valueExpr),
       rc.latestSeq,
-      rc.isBlind
+      rc.isBlind,
+      std::move(referencedCols)
     });
   }
 
   bucket.nextSeq = resolution.maxSeq + 1;
+  rebuildReverseDependencies(bucket);
   // deleteEntry is preserved unchanged — caller decides what to emit
 }
 
@@ -1888,6 +2358,28 @@ static std::vector<Expression> flushBucket(
     return result;
   }
 
+  if(!flushingAllColumns && selectionNeedsDependencyPath(bucket, effectiveColumns)) {
+    auto plan = buildSameRowDependencyPlan(bucket, effectiveColumns);
+    size_t materialisedEntries = 0;
+    auto dependencyUpdates = materialiseDependencyPlan(bucket, plan, materialisedEntries);
+    for(auto& update : dependencyUpdates) {
+      result.push_back(std::move(update));
+    }
+
+    if(walTotalEntries >= materialisedEntries) {
+      walTotalEntries -= materialisedEntries;
+    } else {
+      walTotalEntries = 0;
+    }
+
+    if(!bucketHasPendingWork(bucket)) {
+      walIndex.erase(it);
+    }
+
+    recordPhysicalExpressions(result);
+    return result;
+  }
+
   // V2P: resolve all columns once, without writing the result back into
   // bucket.columnEntries yet. Previously optimiseBucketImpl() wrote every
   // resolved column into the map unconditionally, even though:
@@ -1987,17 +2479,21 @@ static std::vector<Expression> flushBucket(
         colEntries.push_back(WALEntry{
           std::move(pe.valueExpr),
           pe.seq,
-          pe.isBlindWrite
+          pe.isBlindWrite,
+          std::move(pe.referencedCols)
         });
       }
 
+      auto referencedCols = collectReferencedColumnIds(rc.valueExpr);
       colEntries.push_back(WALEntry{
         std::move(rc.valueExpr),
         rc.latestSeq,
-        rc.isBlind
+        rc.isBlind,
+        std::move(referencedCols)
       });
     }
     bucket.nextSeq = resolution.maxSeq + 1;
+    rebuildReverseDependencies(bucket);
 
     // deleteEntry is guaranteed absent here (forced to flushingAllColumns
     // above otherwise). Count pending entries for surviving columns too since
@@ -2241,6 +2737,11 @@ static bool captureMultiRowUpdateOperation(
         colPtr->entries.reserve(WAL_COLUMN_ENTRY_RESERVE);
       }
       colPtr->entries.push_back(WALEntryRef{opId, assignmentIndex, seq});
+      registerReverseDependencies(
+        bucket,
+        colId,
+        seq,
+        operation.assignments[assignmentIndex].referencedCols);
     }
   }
 
