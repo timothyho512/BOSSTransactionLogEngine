@@ -263,6 +263,12 @@ struct RowBucket {
   // Same-row cross-column dependency metadata.
   // referenced column id -> pending entries in this row that read that column.
   std::vector<ReverseDepList> reverseDeps;
+
+  // Fast negative filters for dependency dispatch. These are bucket-wide
+  // summaries: zero means the detailed dependency scan can be skipped, non-zero
+  // only means "maybe" and still falls through to the exact checks.
+  size_t pendingSameRowCrossColumnEntries = 0;
+  size_t pendingCrossRowCellEntries = 0;
 };
  
 // the WAL index: (tableName, rowID) → bucket
@@ -1295,6 +1301,46 @@ static void registerReverseDependencies(RowBucket& bucket,
   }
 }
 
+static bool hasOtherSameRowColumnRef(int32_t readerColId,
+                                     std::vector<int32_t> const& referencedCols) {
+  return std::any_of(
+    referencedCols.begin(),
+    referencedCols.end(),
+    [&](int32_t referencedColId) {
+      return referencedColId != readerColId;
+    });
+}
+
+static void registerBucketDependencySummary(RowBucket& bucket,
+                                            int32_t readerColId,
+                                            std::vector<int32_t> const& referencedCols,
+                                            std::vector<CellKey> const& referencedCells) {
+  if(hasOtherSameRowColumnRef(readerColId, referencedCols)) {
+    bucket.pendingSameRowCrossColumnEntries++;
+  }
+  if(!referencedCells.empty()) {
+    bucket.pendingCrossRowCellEntries++;
+  }
+}
+
+static void unregisterBucketDependencySummary(RowBucket& bucket,
+                                              int32_t readerColId,
+                                              std::vector<int32_t> const& referencedCols,
+                                              std::vector<CellKey> const& referencedCells) {
+  if(hasOtherSameRowColumnRef(readerColId, referencedCols) &&
+     bucket.pendingSameRowCrossColumnEntries > 0) {
+    bucket.pendingSameRowCrossColumnEntries--;
+  }
+  if(!referencedCells.empty() && bucket.pendingCrossRowCellEntries > 0) {
+    bucket.pendingCrossRowCellEntries--;
+  }
+}
+
+static void clearBucketDependencySummary(RowBucket& bucket) {
+  bucket.pendingSameRowCrossColumnEntries = 0;
+  bucket.pendingCrossRowCellEntries = 0;
+}
+
 static void unregisterReverseDependency(RowBucket& bucket,
                                         int32_t referencedColId,
                                         EntryHandle reader) {
@@ -1464,6 +1510,19 @@ static void rebuildReverseDependencies(RowBucket& bucket) {
         }
         auto const& assignment = opIt->second.assignments[ref->assignmentIndex];
         registerReverseDependencies(bucket, col.colId, ref->seq, assignment.referencedCols);
+      }
+    }
+  }
+}
+
+static void rebuildBucketDependencySummary(RowBucket& bucket) {
+  clearBucketDependencySummary(bucket);
+
+  for(auto const& col : bucket.columnEntries) {
+    for(auto const& entry : col.entries) {
+      if(auto const* local = std::get_if<WALEntry>(&entry)) {
+        registerBucketDependencySummary(
+          bucket, col.colId, local->referencedCols, local->referencedCells);
       }
     }
   }
@@ -1702,6 +1761,7 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
               referencedCells
             });
             registerReverseDependencies(bucket, colId, seq, referencedCols);
+            registerBucketDependencySummary(bucket, colId, referencedCols, referencedCells);
             registerCellReverseDependencies(
               bucket,
               colId,
@@ -1927,13 +1987,14 @@ static std::vector<Expression> materialiseLocalEntries(RowBucket const& bucket,
   return materialiseLocalRefSegment(bucket, colId, std::move(entries));
 }
 
-static std::vector<Expression> materialiseLocalRefSegment(RowBucket const& bucket,
+static std::vector<Expression> materialiseLocalRefSegment(RowBucket& bucket,
                                                           int32_t colId,
                                                           std::vector<WALColumnEntry> columnEntries) {
   std::vector<WALEntry> entries;
   entries.reserve(columnEntries.size());
   for(auto& entry : columnEntries) {
     if(auto* local = std::get_if<WALEntry>(&entry)) {
+      unregisterBucketDependencySummary(bucket, colId, local->referencedCols, local->referencedCells);
       unregisterCellReverseDependencies(bucket, colId, local->seq, local->referencedCells);
       entries.push_back(std::move(*local));
     } else if(auto const* ref = std::get_if<WALEntryRef>(&entry)) {
@@ -1950,11 +2011,13 @@ static std::vector<Expression> materialiseLocalRefSegment(RowBucket const& bucke
   return materialiseLocalRefSegment(bucket, colId, std::move(entries));
 }
 
-static void discardLocalRefSegment(RowBucket const& bucket,
+static void discardLocalRefSegment(RowBucket& bucket,
                                    int32_t colId,
                                    std::vector<WALColumnEntry> const& entries) {
   for(auto const& entry : entries) {
     if(auto const* local = std::get_if<WALEntry>(&entry)) {
+      unregisterBucketDependencySummary(
+        bucket, colId, local->referencedCols, local->referencedCells);
       unregisterCellReverseDependencies(bucket, colId, local->seq, local->referencedCells);
     } else if(auto const* ref = std::get_if<WALEntryRef>(&entry)) {
       auto opIt = walOperations.find(ref->opId);
@@ -2403,6 +2466,10 @@ static bool selectionNeedsDependencyPath(RowBucket const& bucket,
     return false;
   }
 
+  if(bucket.pendingSameRowCrossColumnEntries == 0 && bucket.reverseDeps.empty()) {
+    return false;
+  }
+
   for(auto const& name : columns) {
     auto nameIt = columnNameIntern.find(name);
     if(nameIt == columnNameIntern.end()) {
@@ -2425,6 +2492,86 @@ static bool selectionNeedsDependencyPath(RowBucket const& bucket,
   }
 
   return false;
+}
+
+static std::vector<WALEntry> consumeRelevantColumnSegment(RowBucket& bucket,
+                                                          int32_t colId,
+                                                          int cutoffSeq) {
+  std::vector<WALEntry> segment;
+  auto* col = bucket.columnEntries.find(colId);
+  if(!col) {
+    return segment;
+  }
+
+  auto& entries = col->entries;
+  std::vector<size_t> selectedIndexes;
+
+  for(size_t index = entries.size(); index > 0; --index) {
+    size_t i = index - 1;
+    auto const* local = std::get_if<WALEntry>(&entries[i]);
+    if(!local) {
+      continue;
+    }
+
+    if(local->seq > cutoffSeq) {
+      continue;
+    }
+
+    if(bucket.deleteEntry.has_value() && local->seq <= bucket.deleteEntry->seq) {
+      break;
+    }
+
+    selectedIndexes.push_back(i);
+
+    if(overwritesOwnColumn(*local, colId)) {
+      break;
+    }
+  }
+
+  if(selectedIndexes.empty()) {
+    return segment;
+  }
+
+  segment.reserve(selectedIndexes.size());
+
+  size_t firstSelected = selectedIndexes.back();
+  size_t lastSelectedExclusive = selectedIndexes.front() + 1;
+  bool selectedRangeIsContiguous =
+    lastSelectedExclusive - firstSelected == selectedIndexes.size();
+
+  auto consumeLocalEntryAt = [&](size_t index) {
+    auto* local = std::get_if<WALEntry>(&entries[index]);
+    if(!local) {
+      return;
+    }
+    unregisterBucketDependencySummary(
+      bucket, colId, local->referencedCols, local->referencedCells);
+    unregisterReverseDependencies(bucket, colId, local->seq, local->referencedCols);
+    unregisterCellReverseDependencies(bucket, colId, local->seq, local->referencedCells);
+    segment.push_back(std::move(*local));
+  };
+
+  if(selectedRangeIsContiguous) {
+    for(size_t i = firstSelected; i < lastSelectedExclusive; ++i) {
+      consumeLocalEntryAt(i);
+    }
+    entries.erase(entries.begin() + static_cast<std::ptrdiff_t>(firstSelected),
+                  entries.begin() + static_cast<std::ptrdiff_t>(lastSelectedExclusive));
+  } else {
+    for(auto it = selectedIndexes.rbegin(); it != selectedIndexes.rend(); ++it) {
+      consumeLocalEntryAt(*it);
+    }
+
+    for(size_t index : selectedIndexes) {
+      entries.erase(entries.begin() + static_cast<std::ptrdiff_t>(index));
+    }
+  }
+
+  if(entries.empty()) {
+    bucket.columnEntries.erase(colId);
+  }
+
+  return segment;
 }
 
 struct DependencyFlushContext {
@@ -2461,78 +2608,7 @@ struct DependencyFlushContext {
   }
 
   std::vector<WALEntry> consumeRelevantSegment(int32_t colId, int cutoffSeq) {
-    std::vector<WALEntry> segment;
-    auto* col = bucket.columnEntries.find(colId);
-    if(!col) {
-      return segment;
-    }
-
-    auto& entries = col->entries;
-    std::vector<size_t> selectedIndexes;
-
-    for(size_t index = entries.size(); index > 0; --index) {
-      size_t i = index - 1;
-      auto const* local = std::get_if<WALEntry>(&entries[i]);
-      if(!local) {
-        continue;
-      }
-
-      if(local->seq > cutoffSeq) {
-        continue;
-      }
-
-      if(bucket.deleteEntry.has_value() && local->seq <= bucket.deleteEntry->seq) {
-        break;
-      }
-
-      selectedIndexes.push_back(i);
-
-      if(overwritesOwnColumn(*local, colId)) {
-        break;
-      }
-    }
-
-    if(selectedIndexes.empty()) {
-      return segment;
-    }
-
-    segment.reserve(selectedIndexes.size());
-
-    size_t firstSelected = selectedIndexes.back();
-    size_t lastSelectedExclusive = selectedIndexes.front() + 1;
-    bool selectedRangeIsContiguous =
-      lastSelectedExclusive - firstSelected == selectedIndexes.size();
-
-    if(selectedRangeIsContiguous) {
-      for(size_t i = firstSelected; i < lastSelectedExclusive; ++i) {
-        auto* local = std::get_if<WALEntry>(&entries[i]);
-        if(local) {
-          unregisterReverseDependencies(bucket, colId, local->seq, local->referencedCols);
-          unregisterCellReverseDependencies(bucket, colId, local->seq, local->referencedCells);
-          segment.push_back(std::move(*local));
-        }
-      }
-      entries.erase(entries.begin() + static_cast<std::ptrdiff_t>(firstSelected),
-                    entries.begin() + static_cast<std::ptrdiff_t>(lastSelectedExclusive));
-    } else {
-      for(auto it = selectedIndexes.rbegin(); it != selectedIndexes.rend(); ++it) {
-        auto* local = std::get_if<WALEntry>(&entries[*it]);
-        if(local) {
-          unregisterReverseDependencies(bucket, colId, local->seq, local->referencedCols);
-          unregisterCellReverseDependencies(bucket, colId, local->seq, local->referencedCells);
-          segment.push_back(std::move(*local));
-        }
-      }
-
-      for(size_t index : selectedIndexes) {
-        entries.erase(entries.begin() + static_cast<std::ptrdiff_t>(index));
-      }
-    }
-
-    if(entries.empty()) {
-      bucket.columnEntries.erase(colId);
-    }
-
+    auto segment = consumeRelevantColumnSegment(bucket, colId, cutoffSeq);
     consumedEntries += segment.size();
     return segment;
   }
@@ -2694,85 +2770,16 @@ struct CellDependencyFlushContext {
   }
 
   std::vector<WALEntry> consumeRelevantCellSegment(CellKey cell, int cutoffSeq) {
-    std::vector<WALEntry> segment;
     auto* bucket = findBucketMutable(cell);
     if(!bucket) {
-      return segment;
+      return {};
     }
 
-    auto* col = bucket->columnEntries.find(cell.colId);
-    if(!col) {
-      return segment;
-    }
-
-    auto& entries = col->entries;
-    std::vector<size_t> selectedIndexes;
-
-    for(size_t index = entries.size(); index > 0; --index) {
-      size_t i = index - 1;
-      auto const* local = std::get_if<WALEntry>(&entries[i]);
-      if(!local) {
-        continue;
-      }
-
-      if(local->seq > cutoffSeq) {
-        continue;
-      }
-
-      if(bucket->deleteEntry.has_value() && local->seq <= bucket->deleteEntry->seq) {
-        break;
-      }
-
-      selectedIndexes.push_back(i);
-
-      if(overwritesOwnColumn(*local, cell.colId)) {
-        break;
-      }
-    }
-
-    if(selectedIndexes.empty()) {
-      return segment;
-    }
-
-    segment.reserve(selectedIndexes.size());
-
-    size_t firstSelected = selectedIndexes.back();
-    size_t lastSelectedExclusive = selectedIndexes.front() + 1;
-    bool selectedRangeIsContiguous =
-      lastSelectedExclusive - firstSelected == selectedIndexes.size();
-
-    if(selectedRangeIsContiguous) {
-      for(size_t i = firstSelected; i < lastSelectedExclusive; ++i) {
-        auto* local = std::get_if<WALEntry>(&entries[i]);
-        if(local) {
-          unregisterReverseDependencies(*bucket, cell.colId, local->seq, local->referencedCols);
-          unregisterCellReverseDependencies(cell, local->seq, local->referencedCells);
-          segment.push_back(std::move(*local));
-        }
-      }
-      entries.erase(entries.begin() + static_cast<std::ptrdiff_t>(firstSelected),
-                    entries.begin() + static_cast<std::ptrdiff_t>(lastSelectedExclusive));
-    } else {
-      for(auto it = selectedIndexes.rbegin(); it != selectedIndexes.rend(); ++it) {
-        auto* local = std::get_if<WALEntry>(&entries[*it]);
-        if(local) {
-          unregisterReverseDependencies(*bucket, cell.colId, local->seq, local->referencedCols);
-          unregisterCellReverseDependencies(cell, local->seq, local->referencedCells);
-          segment.push_back(std::move(*local));
-        }
-      }
-
-      for(size_t index : selectedIndexes) {
-        entries.erase(entries.begin() + static_cast<std::ptrdiff_t>(index));
-      }
-    }
-
-    if(entries.empty()) {
-      bucket->columnEntries.erase(cell.colId);
-    }
-
+    auto segment = consumeRelevantColumnSegment(*bucket, cell.colId, cutoffSeq);
     consumedEntries += segment.size();
-    markTouched(cell);
+    if(!segment.empty()) {
+      markTouched(cell);
+    }
     return segment;
   }
 
@@ -3059,6 +3066,10 @@ static bool selectionNeedsCrossRowDependencyPath(RowBucket const& bucket,
     return false;
   }
 
+  if(bucket.pendingCrossRowCellEntries == 0 && reverseDepsByCell.empty()) {
+    return false;
+  }
+
   for(auto const& name : columns) {
     auto nameIt = columnNameIntern.find(name);
     if(nameIt == columnNameIntern.end()) {
@@ -3078,6 +3089,39 @@ static bool selectionNeedsCrossRowDependencyPath(RowBucket const& bucket,
   }
 
   return false;
+}
+
+struct DependencyMaterialisationResult {
+  std::vector<Expression> updates;
+  size_t materialisedEntries = 0;
+  bool cleanedTouchedBuckets = false;
+};
+
+static std::optional<DependencyMaterialisationResult> tryMaterialiseDependencySegments(
+  WALKey const& key,
+  RowBucket& bucket,
+  std::vector<std::string> const& effectiveColumns,
+  bool flushingAllColumns) {
+  if(flushingAllColumns) {
+    return std::nullopt;
+  }
+
+  DependencyMaterialisationResult result;
+
+  if(selectionNeedsCrossRowDependencyPath(bucket, effectiveColumns)) {
+    result.updates = materialiseCrossRowDependencySegments(
+      bucket, effectiveColumns, result.materialisedEntries);
+    result.cleanedTouchedBuckets = true;
+    return result;
+  }
+
+  if(selectionNeedsDependencyPath(bucket, effectiveColumns)) {
+    result.updates = materialiseSameRowDependencySegments(
+      key, bucket, effectiveColumns, result.materialisedEntries);
+    return result;
+  }
+
+  return std::nullopt;
 }
 
 // ============================================================
@@ -3194,6 +3238,7 @@ static void optimiseBucketImpl(RowBucket& bucket) {
 
   // clear the old column entries
   unregisterAllCellReverseDependencies(bucket);
+  clearBucketDependencySummary(bucket);
   bucket.columnEntries.clear();
 
   // V2L: rebuild compacted bucket as one structured WAL entry per column.
@@ -3232,6 +3277,7 @@ static void optimiseBucketImpl(RowBucket& bucket) {
   }
 
   rebuildReverseDependencies(bucket);
+  rebuildBucketDependencySummary(bucket);
   registerAllCellReverseDependencies(bucket);
   // deleteEntry is preserved unchanged — caller decides what to emit
 }
@@ -3371,41 +3417,21 @@ static std::vector<Expression> flushBucket(
     return result;
   }
 
-  if(!flushingAllColumns && selectionNeedsCrossRowDependencyPath(bucket, effectiveColumns)) {
-    size_t materialisedEntries = 0;
-    auto dependencyUpdates = materialiseCrossRowDependencySegments(
-      bucket, effectiveColumns, materialisedEntries);
-    recordDependencyMaterialisation(materialisedEntries, dependencyUpdates);
-    for(auto& update : dependencyUpdates) {
+  if(auto dependencyResult = tryMaterialiseDependencySegments(
+       key, bucket, effectiveColumns, flushingAllColumns)) {
+    recordDependencyMaterialisation(
+      dependencyResult->materialisedEntries, dependencyResult->updates);
+    for(auto& update : dependencyResult->updates) {
       result.push_back(std::move(update));
     }
 
-    if(walTotalEntries >= materialisedEntries) {
-      walTotalEntries -= materialisedEntries;
+    if(walTotalEntries >= dependencyResult->materialisedEntries) {
+      walTotalEntries -= dependencyResult->materialisedEntries;
     } else {
       walTotalEntries = 0;
     }
 
-    recordPhysicalExpressions(result);
-    return result;
-  }
-
-  if(!flushingAllColumns && selectionNeedsDependencyPath(bucket, effectiveColumns)) {
-    size_t materialisedEntries = 0;
-    auto dependencyUpdates = materialiseSameRowDependencySegments(
-      key, bucket, effectiveColumns, materialisedEntries);
-    recordDependencyMaterialisation(materialisedEntries, dependencyUpdates);
-    for(auto& update : dependencyUpdates) {
-      result.push_back(std::move(update));
-    }
-
-    if(walTotalEntries >= materialisedEntries) {
-      walTotalEntries -= materialisedEntries;
-    } else {
-      walTotalEntries = 0;
-    }
-
-    if(!bucketHasPendingWork(bucket)) {
+    if(!dependencyResult->cleanedTouchedBuckets && !bucketHasPendingWork(bucket)) {
       walIndex.erase(it);
     }
 
@@ -3499,6 +3525,7 @@ static std::vector<Expression> flushBucket(
     // for every column — including the ones just flushed — are discarded
     // here; the flushed ones don't need to be written back at all.
     unregisterAllCellReverseDependencies(bucket);
+    clearBucketDependencySummary(bucket);
     bucket.columnEntries.clear();
     for(auto& rc : surviving) {
       auto [colPtr, colInserted] = bucket.columnEntries.try_emplace(rc.colId);
@@ -3531,6 +3558,7 @@ static std::vector<Expression> flushBucket(
       });
     }
     rebuildReverseDependencies(bucket);
+    rebuildBucketDependencySummary(bucket);
     registerAllCellReverseDependencies(bucket);
 
     // deleteEntry is guaranteed absent here (forced to flushingAllColumns
