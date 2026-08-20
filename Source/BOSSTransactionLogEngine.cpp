@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <unordered_set>
+#include <deque>
 
 #ifndef BOSS_WAL_INSTRUMENTATION
 #define BOSS_WAL_INSTRUMENTATION 1
@@ -121,6 +123,25 @@ struct CellKeyHash {
   }
 };
 
+enum class SymbolUse {
+  Zero,
+  One,
+  Many
+};
+
+struct CanonicalValueExpression {
+  Expression valueExpr;
+  bool isBlindWrite;
+  SymbolUse targetUse;
+  bool hasLet;
+  bool lexicallyValid;
+  std::vector<int32_t> referencedCols;
+  std::vector<CellKey> referencedCells;
+};
+
+static CanonicalValueExpression canonicalizeValueExpression(
+  Expression valueExpr, Symbol const& targetColumn);
+
 // One WAL entry: the raw expression and its global arrival sequence number
 struct WALEntry {
   Expression valueExpr;
@@ -128,10 +149,27 @@ struct WALEntry {
   bool isBlindWrite = false;
   std::vector<int32_t> referencedCols;
   std::vector<CellKey> referencedCells;
+  SymbolUse targetUse = SymbolUse::Zero;
+  bool hasLet = false;
+  bool lexicallyValid = true;
 };
 
 struct DeleteEntry {
   int seq;
+};
+
+struct InsertAssignment {
+  int32_t colId;
+  Expression valueExpr;
+};
+
+// Row-level base state for a deferred InsertInto. Keep the assignments
+// together, in their original order, because the physical in-memory engine
+// uses the first insert to establish schema order and an insert may be wider
+// than RowBucket's inline update-column storage.
+struct InsertEntry {
+  int seq;
+  std::vector<InsertAssignment> assignments;
 };
 
 using OperationId = uint64_t;
@@ -142,6 +180,9 @@ struct WALAssignment {
   bool isBlindWrite = false;
   std::vector<int32_t> referencedCols;
   std::vector<CellKey> referencedCells;
+  SymbolUse targetUse = SymbolUse::Zero;
+  bool hasLet = false;
+  bool lexicallyValid = true;
 };
 
 struct WALOperation {
@@ -177,12 +218,20 @@ struct CellEntryHandle {
   int seq;
 };
 
-// SelectTarget — result of parsing a Select or Project(Select(...)) expression
-// key:     (tableName, rowID) — which row to flush
-// columns: which columns to flush — empty means flush all columns (bare Select case)
-struct SelectTarget {
-  WALKey key;
+enum class SelectScope {
+  PointRows,
+  WholeTable,
+  Unknown
+};
+
+// SelectPlan describes how much pending state must be materialised before a
+// Select can safely run. tableId is absent when the table has no WAL state.
+struct SelectPlan {
+  SelectScope scope = SelectScope::Unknown;
+  std::optional<int32_t> tableId;
+  std::vector<WALKey> keys;
   std::vector<std::string> columns;
+  bool columnSelectionSafe = false;
 };
 
  
@@ -251,6 +300,15 @@ struct RowBucket {
   // per-column entry lists — inline fixed-size array (Fix 3)
   InlineColVec columnEntries;
 
+  // Pending physical row creation/replacement. This is deliberately not
+  // represented as column updates: the row may not exist in storage yet.
+  std::optional<InsertEntry> insertEntry;
+
+  // Keep the latest insert boundary after its physical InsertInto has been
+  // emitted through a shared operation. Other columns in this bucket may
+  // still need the boundary sequence to discard older local entries lazily.
+  int materialisedInsertSeq = -1;
+
   // latest Delete for this row
   std::optional<DeleteEntry> deleteEntry;
 
@@ -269,28 +327,134 @@ struct RowBucket {
   // only means "maybe" and still falls through to the exact checks.
   size_t pendingSameRowCrossColumnEntries = 0;
   size_t pendingCrossRowCellEntries = 0;
+
+  // Position of this row ID in tableBucketRows[tableId]. The auxiliary table
+  // index lets table-scoped reads enumerate only this table's WAL buckets.
+  size_t tableRowPosition = std::numeric_limits<size_t>::max();
 };
- 
+
+struct ReadBucketObservation {
+  bool found = false;
+  bool columnSelective = false;
+  bool hasInsert = false;
+  bool hasDelete = false;
+  bool hasColumnUpdates = false;
+  bool hasSameRowDependencies = false;
+  bool hasCrossRowDependencies = false;
+  size_t columnCount = 0;
+  size_t entriesFlushed = 0;
+};
+
+struct PendingInsertHandle {
+  WALKey key;
+  int insertSeq;
+};
+
+static int latestColumnResetSeq(
+  RowBucket const& bucket,
+  int cutoffSeq = std::numeric_limits<int>::max()) {
+  int resetSeq = -1;
+  if(bucket.deleteEntry.has_value() && bucket.deleteEntry->seq <= cutoffSeq) {
+    resetSeq = bucket.deleteEntry->seq;
+  }
+  if(bucket.materialisedInsertSeq <= cutoffSeq) {
+    resetSeq = std::max(resetSeq, bucket.materialisedInsertSeq);
+  }
+  if(bucket.insertEntry.has_value() && bucket.insertEntry->seq <= cutoffSeq) {
+    resetSeq = std::max(resetSeq, bucket.insertEntry->seq);
+  }
+  return resetSeq;
+}
+
 // the WAL index: (tableName, rowID) → bucket
 // Fix 2: ankerl::unordered_dense stores entries in a flat contiguous array,
 // eliminating one heap pointer hop per lookup compared to std::unordered_map.
 static ankerl::unordered_dense::map<WALKey, RowBucket, WALKeyHash> walIndex;
+static std::vector<std::vector<int64_t>> tableBucketRows;
 static ankerl::unordered_dense::map<OperationId, WALOperation> walOperations;
 static OperationId nextOperationId = 0;
+static uint64_t nextGeneratedLocalId = 0;
 static int globalNextSeq = 0;
 static ankerl::unordered_dense::map<CellKey, std::vector<CellEntryHandle>, CellKeyHash> reverseDepsByCell;
 static size_t pendingCrossRowRefEntries = 0;
 
+using WALIndexIterator = decltype(walIndex)::iterator;
+
+static std::pair<WALIndexIterator, bool> tryEmplaceBucket(WALKey const& key) {
+  auto [bucketIt, inserted] = walIndex.try_emplace(key);
+  if(!inserted) {
+    return {bucketIt, false};
+  }
+
+  if(tableBucketRows.size() <= static_cast<size_t>(key.first)) {
+    tableBucketRows.resize(static_cast<size_t>(key.first) + 1);
+  }
+  auto& tableRows = tableBucketRows[static_cast<size_t>(key.first)];
+  bucketIt->second.tableRowPosition = tableRows.size();
+  tableRows.push_back(key.second);
+  return {bucketIt, true};
+}
+
+static void unregisterBucket(WALIndexIterator bucketIt) {
+  auto const& key = bucketIt->first;
+  auto& bucket = bucketIt->second;
+  auto const missingPosition = std::numeric_limits<size_t>::max();
+
+  if(key.first < 0 ||
+     tableBucketRows.size() <= static_cast<size_t>(key.first)) {
+    throw std::logic_error("WAL bucket is missing its table index");
+  }
+
+  auto& tableRows = tableBucketRows[static_cast<size_t>(key.first)];
+  size_t position = bucket.tableRowPosition;
+  if(position >= tableRows.size() || tableRows[position] != key.second) {
+    throw std::logic_error("WAL bucket table-index position is inconsistent");
+  }
+
+  int64_t movedRowId = tableRows.back();
+  if(position + 1 != tableRows.size()) {
+    auto movedBucketIt = walIndex.find(WALKey{key.first, movedRowId});
+    if(movedBucketIt == walIndex.end()) {
+      throw std::logic_error("WAL table index references a missing bucket");
+    }
+    tableRows[position] = movedRowId;
+    movedBucketIt->second.tableRowPosition = position;
+  }
+  tableRows.pop_back();
+  bucket.tableRowPosition = missingPosition;
+}
+
+static void eraseBucket(WALIndexIterator bucketIt) {
+  unregisterBucket(bucketIt);
+  walIndex.erase(bucketIt);
+}
+
 // total number of entries across all buckets — for threshold check
 static size_t walTotalEntries = 0;
+
+// Inserts use unique row IDs in workloads such as TPC-C, so a per-row update
+// chain bound cannot limit their aggregate memory use. Keep a sequence-tagged
+// queue so stale handles from replacement or indirect materialisation are safe.
+static std::deque<PendingInsertHandle> pendingInsertQueue;
+static size_t pendingInsertRows = 0;
+static size_t WAL_INSERT_DRAIN_THRESHOLD = 0; // zero disables automatic draining
  
 // Threshold for WAL flush
 static size_t WAL_THRESHOLD = 200'000'000;
-// V2A: reserve capacity for per-column WAL entry vectors.
-// The profiling run used chain length 100, so 128 gives enough space
-// for a typical hot row-column chain while keeping memory overhead modest.
-// reserve() changes vector capacity only; it does not create WAL entries.
-static constexpr size_t WAL_COLUMN_ENTRY_RESERVE = 128;
+
+// Keep short-lived OLTP chains compact, then reserve once a column proves hot.
+// This avoids capacity 128 for the common one-to-four-entry case without
+// repeatedly growing long chains through 16, 32, 64, and 128 entries.
+static constexpr size_t WAL_HOT_COLUMN_THRESHOLD = 8;
+static constexpr size_t WAL_HOT_COLUMN_CAPACITY = 128;
+
+static void reserveHotColumnIfNeeded(
+  std::vector<WALColumnEntry>& entries) {
+  if(entries.size() == WAL_HOT_COLUMN_THRESHOLD &&
+     entries.capacity() < WAL_HOT_COLUMN_CAPACITY) {
+    entries.reserve(WAL_HOT_COLUMN_CAPACITY);
+  }
+}
 
 // ============================================================
 // WAL instrumentation counters
@@ -312,6 +476,8 @@ static constexpr size_t WAL_COLUMN_ENTRY_RESERVE = 128;
 
 enum class FlushReason {
   ChainThreshold,
+  InsertThreshold,
+  GlobalThreshold,
   ReadTriggered,
   Manual,
   Other
@@ -324,15 +490,48 @@ struct WALInstrumentationStats {
   uint64_t walEntriesFlushed = 0;
 
   uint64_t physicalUpdatesApplied = 0;
+  uint64_t physicalInsertsApplied = 0;
   uint64_t physicalDeletesApplied = 0;
 
   uint64_t dependencyEntriesConsumed = 0;
   uint64_t dependencyPhysicalUpdatesEmitted = 0;
 
   uint64_t readTriggeredFlushes = 0;
+  uint64_t readTriggeredWALEntries = 0;
+  uint64_t readRequests = 0;
+  uint64_t pointReadRequests = 0;
+  uint64_t wholeTableReadRequests = 0;
+  uint64_t unknownReadRequests = 0;
+  uint64_t readRequestsWithPendingBuckets = 0;
+  uint64_t readPendingBucketsAtPlan = 0;
+  uint64_t readBucketsMaterialised = 0;
+  uint64_t readPhysicalExpressionsEmitted = 0;
+  uint64_t pointReadBucketsMaterialised = 0;
+  uint64_t wholeTableReadBucketsMaterialised = 0;
+  uint64_t unknownReadBucketsMaterialised = 0;
+  uint64_t readColumnSelectiveBuckets = 0;
+  uint64_t readBucketsWithInsert = 0;
+  uint64_t readBucketsWithDelete = 0;
+  uint64_t readBucketsWithColumnUpdates = 0;
+  uint64_t readBucketsWithSameRowDependencies = 0;
+  uint64_t readBucketsWithCrossRowDependencies = 0;
+  uint64_t readLifecycleOnlyBuckets = 0;
+  uint64_t readOneColumnBuckets = 0;
+  uint64_t readMultiColumnBuckets = 0;
+  uint64_t readZeroEntryBuckets = 0;
+  uint64_t readOneEntryBuckets = 0;
+  uint64_t readTwoToFourEntryBuckets = 0;
+  uint64_t readFiveToSixteenEntryBuckets = 0;
+  uint64_t readOverSixteenEntryBuckets = 0;
   uint64_t chainTriggeredFlushes = 0;
+  uint64_t insertTriggeredFlushes = 0;
+  uint64_t globalThresholdFlushes = 0;
   uint64_t manualFlushes = 0;
   uint64_t otherFlushes = 0;
+
+  uint64_t insertDrainCalls = 0;
+  uint64_t insertRowsDrained = 0;
+  uint64_t peakPendingInsertRows = 0;
 
   uint64_t totalEntriesPerFlush = 0;
   uint64_t maxEntriesInSingleFlush = 0;
@@ -340,8 +539,121 @@ struct WALInstrumentationStats {
 
 static WALInstrumentationStats walStats;
 
+struct ReadTableInstrumentationStats {
+  uint64_t pointRequests = 0;
+  uint64_t wholeTableRequests = 0;
+  uint64_t pendingBucketsAtPlan = 0;
+  uint64_t bucketsMaterialised = 0;
+  uint64_t physicalExpressionsEmitted = 0;
+  uint64_t pointBucketsMaterialised = 0;
+  uint64_t wholeTableBucketsMaterialised = 0;
+  uint64_t insertBuckets = 0;
+  uint64_t updateBuckets = 0;
+  uint64_t deleteBuckets = 0;
+};
+
+static std::vector<ReadTableInstrumentationStats> readTableStats;
+
 static void resetWALStats() {
   walStats = WALInstrumentationStats{};
+  walStats.peakPendingInsertRows = pendingInsertRows;
+  readTableStats.clear();
+}
+
+static ReadTableInstrumentationStats* readStatsForTable(
+  std::optional<int32_t> tableId) {
+  if(!tableId.has_value() || *tableId < 0) return nullptr;
+  size_t index = static_cast<size_t>(*tableId);
+  if(readTableStats.size() <= index) readTableStats.resize(index + 1);
+  return &readTableStats[index];
+}
+
+static void recordReadRequest(SelectPlan const& plan,
+                              size_t pendingBucketsAtPlan) {
+  walStats.readRequests++;
+  walStats.readPendingBucketsAtPlan += pendingBucketsAtPlan;
+  if(pendingBucketsAtPlan > 0) walStats.readRequestsWithPendingBuckets++;
+
+  auto* tableStats = readStatsForTable(plan.tableId);
+  if(tableStats) tableStats->pendingBucketsAtPlan += pendingBucketsAtPlan;
+
+  switch(plan.scope) {
+    case SelectScope::PointRows:
+      walStats.pointReadRequests++;
+      if(tableStats) tableStats->pointRequests++;
+      break;
+    case SelectScope::WholeTable:
+      walStats.wholeTableReadRequests++;
+      if(tableStats) tableStats->wholeTableRequests++;
+      break;
+    case SelectScope::Unknown:
+      walStats.unknownReadRequests++;
+      break;
+  }
+}
+
+static void recordReadBucketMaterialised(
+  SelectScope scope,
+  int32_t tableId,
+  ReadBucketObservation const& observation,
+  size_t physicalExpressionsEmitted) {
+  walStats.readBucketsMaterialised++;
+  walStats.readPhysicalExpressionsEmitted += physicalExpressionsEmitted;
+
+  switch(scope) {
+    case SelectScope::PointRows:
+      walStats.pointReadBucketsMaterialised++;
+      break;
+    case SelectScope::WholeTable:
+      walStats.wholeTableReadBucketsMaterialised++;
+      break;
+    case SelectScope::Unknown:
+      walStats.unknownReadBucketsMaterialised++;
+      break;
+  }
+
+  if(observation.columnSelective) walStats.readColumnSelectiveBuckets++;
+  if(observation.hasInsert) walStats.readBucketsWithInsert++;
+  if(observation.hasDelete) walStats.readBucketsWithDelete++;
+  if(observation.hasColumnUpdates) walStats.readBucketsWithColumnUpdates++;
+  if(observation.hasSameRowDependencies) {
+    walStats.readBucketsWithSameRowDependencies++;
+  }
+  if(observation.hasCrossRowDependencies) {
+    walStats.readBucketsWithCrossRowDependencies++;
+  }
+
+  if(observation.columnCount == 0) {
+    walStats.readLifecycleOnlyBuckets++;
+  } else if(observation.columnCount == 1) {
+    walStats.readOneColumnBuckets++;
+  } else {
+    walStats.readMultiColumnBuckets++;
+  }
+
+  if(observation.entriesFlushed == 0) {
+    walStats.readZeroEntryBuckets++;
+  } else if(observation.entriesFlushed == 1) {
+    walStats.readOneEntryBuckets++;
+  } else if(observation.entriesFlushed <= 4) {
+    walStats.readTwoToFourEntryBuckets++;
+  } else if(observation.entriesFlushed <= 16) {
+    walStats.readFiveToSixteenEntryBuckets++;
+  } else {
+    walStats.readOverSixteenEntryBuckets++;
+  }
+
+  auto* tableStats = readStatsForTable(tableId);
+  if(!tableStats) return;
+  tableStats->bucketsMaterialised++;
+  tableStats->physicalExpressionsEmitted += physicalExpressionsEmitted;
+  if(scope == SelectScope::PointRows) tableStats->pointBucketsMaterialised++;
+  if(scope == SelectScope::WholeTable) {
+    tableStats->wholeTableBucketsMaterialised++;
+  }
+  if(observation.hasInsert) tableStats->insertBuckets++;
+  if(observation.hasColumnUpdates) tableStats->updateBuckets++;
+  if(observation.hasDelete) tableStats->deleteBuckets++;
 }
 
 static void recordFlushStart(FlushReason reason, size_t entriesBeforeFlush) {
@@ -356,8 +668,15 @@ static void recordFlushStart(FlushReason reason, size_t entriesBeforeFlush) {
     case FlushReason::ChainThreshold:
       walStats.chainTriggeredFlushes++;
       break;
+    case FlushReason::InsertThreshold:
+      walStats.insertTriggeredFlushes++;
+      break;
+    case FlushReason::GlobalThreshold:
+      walStats.globalThresholdFlushes++;
+      break;
     case FlushReason::ReadTriggered:
       walStats.readTriggeredFlushes++;
+      walStats.readTriggeredWALEntries += entriesBeforeFlush;
       break;
     case FlushReason::Manual:
       walStats.manualFlushes++;
@@ -368,6 +687,16 @@ static void recordFlushStart(FlushReason reason, size_t entriesBeforeFlush) {
   }
 }
 
+static void recordPendingInsertCapture() {
+  walStats.peakPendingInsertRows =
+    std::max<uint64_t>(walStats.peakPendingInsertRows, pendingInsertRows);
+}
+
+static void recordInsertDrain(size_t rowsDrained) {
+  walStats.insertDrainCalls++;
+  walStats.insertRowsDrained += rowsDrained;
+}
+
 static void recordPhysicalExpressions(std::vector<Expression> const& expressions) {
   for(auto const& expression : expressions) {
     auto const* complex = get_if<ComplexExpression>(&expression);
@@ -375,6 +704,8 @@ static void recordPhysicalExpressions(std::vector<Expression> const& expressions
 
     if(complex->getHead() == "Update"_) {
       walStats.physicalUpdatesApplied++;
+    } else if(complex->getHead() == "InsertInto"_) {
+      walStats.physicalInsertsApplied++;
     } else if(complex->getHead() == "Delete"_) {
       walStats.physicalDeletesApplied++;
     }
@@ -409,6 +740,7 @@ static void printWALStats(std::string const& label = "") {
   std::cout << "walEntriesCreated          = " << walStats.walEntriesCreated << "\n";
   std::cout << "walEntriesFlushed          = " << walStats.walEntriesFlushed << "\n";
   std::cout << "physicalUpdatesApplied     = " << walStats.physicalUpdatesApplied << "\n";
+  std::cout << "physicalInsertsApplied     = " << walStats.physicalInsertsApplied << "\n";
   std::cout << "physicalDeletesApplied     = " << walStats.physicalDeletesApplied << "\n";
   std::cout << "dependencyEntriesConsumed  = "
             << walStats.dependencyEntriesConsumed << "\n";
@@ -417,9 +749,63 @@ static void printWALStats(std::string const& label = "") {
 
   std::cout << "flushCalls                 = " << walStats.flushCalls << "\n";
   std::cout << "readTriggeredFlushes       = " << walStats.readTriggeredFlushes << "\n";
+  std::cout << "readTriggeredWALEntries    = " << walStats.readTriggeredWALEntries << "\n";
+  std::cout << "readRequests               = " << walStats.readRequests << "\n";
+  std::cout << "pointReadRequests          = " << walStats.pointReadRequests << "\n";
+  std::cout << "wholeTableReadRequests     = " << walStats.wholeTableReadRequests << "\n";
+  std::cout << "unknownReadRequests        = " << walStats.unknownReadRequests << "\n";
+  std::cout << "readRequestsWithPending    = "
+            << walStats.readRequestsWithPendingBuckets << "\n";
+  std::cout << "readPendingBucketsAtPlan   = "
+            << walStats.readPendingBucketsAtPlan << "\n";
+  std::cout << "readBucketsMaterialised    = "
+            << walStats.readBucketsMaterialised << "\n";
+  std::cout << "readPhysicalExprsEmitted   = "
+            << walStats.readPhysicalExpressionsEmitted << "\n";
+  std::cout << "pointReadBucketsMaterialised = "
+            << walStats.pointReadBucketsMaterialised << "\n";
+  std::cout << "wholeReadBucketsMaterialised = "
+            << walStats.wholeTableReadBucketsMaterialised << "\n";
+  std::cout << "unknownReadBucketsMaterialised = "
+            << walStats.unknownReadBucketsMaterialised << "\n";
+  std::cout << "readColumnSelectiveBuckets = "
+            << walStats.readColumnSelectiveBuckets << "\n";
+  std::cout << "readBucketsWithInsert      = "
+            << walStats.readBucketsWithInsert << "\n";
+  std::cout << "readBucketsWithDelete      = "
+            << walStats.readBucketsWithDelete << "\n";
+  std::cout << "readBucketsWithUpdates     = "
+            << walStats.readBucketsWithColumnUpdates << "\n";
+  std::cout << "readBucketsWithSameRowDeps = "
+            << walStats.readBucketsWithSameRowDependencies << "\n";
+  std::cout << "readBucketsWithCrossRowDeps = "
+            << walStats.readBucketsWithCrossRowDependencies << "\n";
+  std::cout << "readLifecycleOnlyBuckets   = "
+            << walStats.readLifecycleOnlyBuckets << "\n";
+  std::cout << "readOneColumnBuckets       = "
+            << walStats.readOneColumnBuckets << "\n";
+  std::cout << "readMultiColumnBuckets     = "
+            << walStats.readMultiColumnBuckets << "\n";
+  std::cout << "readEntryBuckets[0]        = "
+            << walStats.readZeroEntryBuckets << "\n";
+  std::cout << "readEntryBuckets[1]        = "
+            << walStats.readOneEntryBuckets << "\n";
+  std::cout << "readEntryBuckets[2-4]      = "
+            << walStats.readTwoToFourEntryBuckets << "\n";
+  std::cout << "readEntryBuckets[5-16]     = "
+            << walStats.readFiveToSixteenEntryBuckets << "\n";
+  std::cout << "readEntryBuckets[17+]      = "
+            << walStats.readOverSixteenEntryBuckets << "\n";
   std::cout << "chainTriggeredFlushes      = " << walStats.chainTriggeredFlushes << "\n";
+  std::cout << "insertTriggeredFlushes     = " << walStats.insertTriggeredFlushes << "\n";
+  std::cout << "globalThresholdFlushes     = " << walStats.globalThresholdFlushes << "\n";
   std::cout << "manualFlushes              = " << walStats.manualFlushes << "\n";
   std::cout << "otherFlushes               = " << walStats.otherFlushes << "\n";
+  std::cout << "insertDrainCalls           = " << walStats.insertDrainCalls << "\n";
+  std::cout << "insertRowsDrained          = " << walStats.insertRowsDrained << "\n";
+  std::cout << "peakPendingInsertRows      = " << walStats.peakPendingInsertRows << "\n";
+  std::cout << "pendingInsertRowsNow       = " << pendingInsertRows << "\n";
+  std::cout << "insertDrainThreshold       = " << WAL_INSERT_DRAIN_THRESHOLD << "\n";
 
   if(walStats.flushCalls > 0) {
     std::cout << "avgEntriesPerFlush         = "
@@ -446,6 +832,29 @@ static void printWALStats(std::string const& label = "") {
   }
 
   std::cout << "pendingWALEntriesNow       = " << walTotalEntries << "\n";
+  for(size_t tableId = 0; tableId < readTableStats.size(); ++tableId) {
+    auto const& stats = readTableStats[tableId];
+    if(stats.pointRequests == 0 && stats.wholeTableRequests == 0 &&
+       stats.pendingBucketsAtPlan == 0 && stats.bucketsMaterialised == 0 &&
+       stats.physicalExpressionsEmitted == 0) {
+      continue;
+    }
+
+    std::string tableName = tableId < tableIdToSymbol.size()
+      ? tableIdToSymbol[tableId].getName()
+      : std::to_string(tableId);
+    std::cout << "readTable[" << tableName << "]"
+              << " point=" << stats.pointRequests
+              << " whole=" << stats.wholeTableRequests
+              << " pending=" << stats.pendingBucketsAtPlan
+              << " materialised=" << stats.bucketsMaterialised
+              << " pointMat=" << stats.pointBucketsMaterialised
+              << " wholeMat=" << stats.wholeTableBucketsMaterialised
+              << " insert=" << stats.insertBuckets
+              << " update=" << stats.updateBuckets
+              << " delete=" << stats.deleteBuckets
+              << " emitted=" << stats.physicalExpressionsEmitted << "\n";
+  }
   std::cout << "------------------------------------------\n";
 }
 
@@ -453,6 +862,8 @@ static void printWALStats(std::string const& label = "") {
 
 enum class FlushReason {
   ChainThreshold,
+  InsertThreshold,
+  GlobalThreshold,
   ReadTriggered,
   Manual,
   Other
@@ -462,7 +873,16 @@ static void resetWALStats() {}
 
 static void recordFlushStart(FlushReason, size_t) {}
 
+static void recordPendingInsertCapture() {}
+
+static void recordInsertDrain(size_t) {}
+
 static void recordPhysicalExpressions(std::vector<Expression> const&) {}
+
+static void recordReadRequest(SelectPlan const&, size_t) {}
+
+static void recordReadBucketMaterialised(
+  SelectScope, int32_t, ReadBucketObservation const&, size_t) {}
 
 static void recordDependencyMaterialisation(size_t, std::vector<Expression> const&) {}
 
@@ -570,81 +990,6 @@ static void visitRowIDs(ComplexExpression const& idListExpr, Callback callback) 
       }
     }, spanArg);
   }
-}
-
-// Helper function for the optimsation rule
-
-static bool containsSymbol(Expression const& expr);
-
-template <typename T>
-static bool containsSymbolValue(T const& value);
-
-template <typename WrappedArgument>
-static bool containsSymbolArgument(WrappedArgument const& wrappedArg);
-
-template <typename T>
-static bool containsSymbolValue(T const& value) {
-  using Decayed = std::decay_t<T>;
-
-  if constexpr(std::is_same_v<Decayed, Symbol>) {
-    return true;
-  } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
-    auto const& args = value.getArguments();
-
-    for(auto const& arg : args) {
-      if(containsSymbolArgument(arg)) return true;
-    }
-
-    return false;
-  } else if constexpr(std::is_same_v<Decayed, Expression>) {
-    return containsSymbol(value);
-  } else {
-    return false;
-  }
-}
-
-template <typename WrappedArgument>
-static bool containsSymbolArgument(WrappedArgument const& wrappedArg) {
-  return std::visit(
-    [](auto const& unwrapped) -> bool {
-      using Decayed = std::decay_t<decltype(unwrapped)>;
-
-      if constexpr(boss::utilities::isInstanceOfTemplate<
-                     Decayed, boss::expressions::generic::MovableReferenceWrapper>::value) {
-        return containsSymbolValue(unwrapped.get());
-      } else {
-        return containsSymbolValue(unwrapped);
-      }
-    },
-    wrappedArg.getArgument()
-  );
-}
-
-// Check if a value expression contains any Symbol references
-// A Symbol in a value expression means it reads a column — making it a dependent write
-// e.g. Plus(price, 1) contains Symbol "price" → dependent write
-// e.g. 100.0 contains no Symbols → blind write
-static bool containsSymbol(Expression const& expr) {
-  return std::visit(
-    [](auto const& value) -> bool {
-      return containsSymbolValue(value);
-    },
-    expr
-  );
-}
-
-static bool isBlindValueWrite(Expression const& valueExpr) {
-  return !containsSymbol(valueExpr);
-}
-
-// Check if a column assignment in Set(...) is a blind write
-// e.g. price(100.0) → blind write, price(Plus(price, 1)) → dependent write
-static bool isBlindWrite(ComplexExpression const& colAssign) {
-  auto const& args = colAssign.getArguments();
-
-  if(args.empty()) return true;
-
-  return !containsSymbolArgument(args[0]);
 }
 
 static std::vector<int32_t> collectReferencedColumnIds(Expression const& expr);
@@ -809,69 +1154,11 @@ static Expression simplifyConstantFold(Expression expr) {
   return ComplexExpression(std::move(outerMoveHead), {}, std::move(newArgs), {});
 }
 
-enum class SymbolUse {
-  Zero,
-  One,
-  Many
-};
-
-template <typename WrappedArgument>
-static SymbolUse classifySymbolUseArgument(WrappedArgument const& wrappedArg,
-                                           Symbol const& target);
-
-static SymbolUse classifySymbolUse(Expression const& expr, Symbol const& target);
-
 static SymbolUse combineSymbolUse(SymbolUse accumulated, SymbolUse next) {
   if(accumulated == SymbolUse::Many || next == SymbolUse::Many) return SymbolUse::Many;
   if(accumulated == SymbolUse::One && next == SymbolUse::One) return SymbolUse::Many;
   if(accumulated == SymbolUse::One || next == SymbolUse::One) return SymbolUse::One;
   return SymbolUse::Zero;
-}
-
-template <typename T>
-static SymbolUse classifySymbolUseValue(T const& value, Symbol const& target) {
-  using Decayed = std::decay_t<T>;
-
-  if constexpr(boss::utilities::isInstanceOfTemplate<
-                 Decayed, boss::expressions::generic::MovableReferenceWrapper>::value) {
-    return classifySymbolUseValue(value.get(), target);
-  } else if constexpr(std::is_same_v<Decayed, Symbol>) {
-    return value == target ? SymbolUse::One : SymbolUse::Zero;
-  } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
-    SymbolUse use = SymbolUse::Zero;
-    auto const& args = value.getArguments();
-
-    for(auto const& arg : args) {
-      use = combineSymbolUse(use, classifySymbolUseArgument(arg, target));
-      if(use == SymbolUse::Many) return SymbolUse::Many;
-    }
-
-    return use;
-  } else if constexpr(std::is_same_v<Decayed, Expression>) {
-    return classifySymbolUse(value, target);
-  } else {
-    return SymbolUse::Zero;
-  }
-}
-
-template <typename WrappedArgument>
-static SymbolUse classifySymbolUseArgument(WrappedArgument const& wrappedArg,
-                                           Symbol const& target) {
-  return visitArgumentByReference(
-    wrappedArg,
-    [&](auto const& unwrapped) -> SymbolUse {
-      return classifySymbolUseValue(unwrapped, target);
-    }
-  );
-}
-
-static SymbolUse classifySymbolUse(Expression const& expr, Symbol const& target) {
-  return std::visit(
-    [&](auto const& value) -> SymbolUse {
-      return classifySymbolUseValue(value, target);
-    },
-    expr
-  );
 }
 
 static Expression buildTableNameExpression(RowBucket const& bucket) {
@@ -892,11 +1179,87 @@ static Expression buildRowIdExpression(RowBucket const& bucket) {
   return ComplexExpression("id"_, {}, std::move(idColArgs), {});
 }
 
+static Expression buildInsertExpression(RowBucket const& bucket, InsertEntry& insert) {
+  boss::ExpressionArguments insertArgs;
+  insertArgs.reserve(1 + insert.assignments.size());
+  insertArgs.push_back(buildTableNameExpression(bucket));
+
+  for(auto& assignment : insert.assignments) {
+    boss::ExpressionArguments columnArgs;
+    columnArgs.push_back(std::move(assignment.valueExpr));
+    insertArgs.push_back(ComplexExpression(
+      columnIdToSymbol[assignment.colId], {}, std::move(columnArgs), {}));
+  }
+
+  return ComplexExpression("InsertInto"_, {}, std::move(insertArgs), {});
+}
+
+static Expression buildInsertDebugSummary(RowBucket const& bucket,
+                                          InsertEntry const& insert) {
+  boss::ExpressionArguments args;
+  args.push_back(tableIdToSymbol[bucket.tableId]);
+  std::visit([&](auto rowId) { args.push_back(rowId); }, bucket.rowId);
+  args.push_back(static_cast<int64_t>(insert.seq));
+  args.push_back(static_cast<int64_t>(insert.assignments.size()));
+  return ComplexExpression("WALInsert"_, {}, std::move(args), {});
+}
+
+static void materialisePendingInsert(RowBucket& bucket,
+                                     std::vector<Expression>& result) {
+  if(!bucket.insertEntry.has_value()) {
+    return;
+  }
+
+  int insertSeq = bucket.insertEntry->seq;
+  result.push_back(buildInsertExpression(bucket, *bucket.insertEntry));
+  bucket.insertEntry.reset();
+  bucket.materialisedInsertSeq = std::max(bucket.materialisedInsertSeq, insertSeq);
+  if(pendingInsertRows > 0) {
+    pendingInsertRows--;
+  }
+  if(pendingInsertRows == 0) {
+    pendingInsertQueue.clear();
+  }
+  if(walTotalEntries > 0) {
+    walTotalEntries--;
+  }
+}
+
+static bool materialisePendingInsertBefore(RowBucket& bucket,
+                                           int cutoffSeq,
+                                           std::vector<Expression>& result) {
+  if(!bucket.insertEntry.has_value() || bucket.insertEntry->seq > cutoffSeq) {
+    return false;
+  }
+  materialisePendingInsert(bucket, result);
+  return true;
+}
+
 static Expression buildDeleteExpression(RowBucket const& bucket) {
   boss::ExpressionArguments deleteArgs;
   deleteArgs.push_back(buildTableNameExpression(bucket));
   deleteArgs.push_back(buildRowIdExpression(bucket));
   return ComplexExpression("Delete"_, {}, std::move(deleteArgs), {});
+}
+
+// Emit row-level lifecycle boundaries in their original logical order.
+// Column resolution already discards entries at or before the latest boundary,
+// so any resolved updates can safely be emitted after this lifecycle prefix.
+static void materialisePendingLifecycle(RowBucket& bucket,
+                                        std::vector<Expression>& result) {
+  bool deleteBeforeInsert =
+    bucket.deleteEntry.has_value() && bucket.insertEntry.has_value() &&
+    bucket.deleteEntry->seq < bucket.insertEntry->seq;
+
+  if(deleteBeforeInsert) {
+    result.push_back(buildDeleteExpression(bucket));
+  }
+
+  materialisePendingInsert(bucket, result);
+
+  if(bucket.deleteEntry.has_value() && !deleteBeforeInsert) {
+    result.push_back(buildDeleteExpression(bucket));
+  }
 }
 
 static Expression buildDeleteDebugSummary(RowBucket const& bucket, int seq) {
@@ -970,16 +1333,18 @@ static bool captureAssignmentsFromSet(Expression setExpression, WALOperation& op
       continue;
     }
 
-    Expression valueExpr = std::move(colDynamics[0]);
-    bool blind = isBlindValueWrite(valueExpr);
-    auto referencedCols = collectReferencedColumnIds(valueExpr);
-    auto referencedCells = collectReferencedCellKeys(valueExpr);
+    int32_t colId = internColumnName(colHead.getName());
+    auto canonical = canonicalizeValueExpression(
+      std::move(colDynamics[0]), columnIdToSymbol[colId]);
     operation.assignments.push_back({
-      internColumnName(colHead.getName()),
-      std::move(valueExpr),
-      blind,
-      std::move(referencedCols),
-      std::move(referencedCells)
+      colId,
+      std::move(canonical.valueExpr),
+      canonical.isBlindWrite,
+      std::move(canonical.referencedCols),
+      std::move(canonical.referencedCells),
+      canonical.targetUse,
+      canonical.hasLet,
+      canonical.lexicallyValid
     });
   }
 
@@ -998,7 +1363,10 @@ static WALEntry consumeColumnEntryRef(WALEntryRef const& ref) {
     ref.seq,
     assignment.isBlindWrite,
     std::move(assignment.referencedCols),
-    std::move(assignment.referencedCells)
+    std::move(assignment.referencedCells),
+    assignment.targetUse,
+    assignment.hasLet,
+    assignment.lexicallyValid
   };
   walOperations.erase(opIt);
   return entry;
@@ -1253,6 +1621,204 @@ static std::vector<CellKey> collectReferencedCellKeys(Expression const& expr) {
     expr
   );
   return referenced;
+}
+
+struct LexicalBinding {
+  std::string sourceName;
+  Symbol internalName;
+};
+
+struct CanonicalizationContext {
+  Symbol const& targetColumn;
+  std::vector<LexicalBinding> bindings;
+  std::unordered_set<std::string> usedNames;
+  std::vector<int32_t> referencedCols;
+  std::vector<CellKey> referencedCells;
+  SymbolUse targetUse = SymbolUse::Zero;
+  bool hasLet = false;
+  bool lexicallyValid = true;
+  bool hasOpaqueRead = false;
+};
+
+template <typename T>
+static void collectAllSymbolNamesValue(
+  T const& value, std::unordered_set<std::string>& names);
+
+template <typename WrappedArgument>
+static void collectAllSymbolNamesArgument(
+  WrappedArgument const& wrappedArg, std::unordered_set<std::string>& names) {
+  visitArgumentByReference(
+    wrappedArg,
+    [&](auto const& unwrapped) {
+      collectAllSymbolNamesValue(unwrapped, names);
+    });
+}
+
+template <typename T>
+static void collectAllSymbolNamesValue(
+  T const& value, std::unordered_set<std::string>& names) {
+  using Decayed = std::decay_t<T>;
+
+  if constexpr(boss::utilities::isInstanceOfTemplate<
+                 Decayed, boss::expressions::generic::MovableReferenceWrapper>::value) {
+    collectAllSymbolNamesValue(value.get(), names);
+  } else if constexpr(std::is_same_v<Decayed, Symbol>) {
+    names.insert(value.getName());
+  } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
+    for(auto const& arg : value.getArguments()) {
+      collectAllSymbolNamesArgument(arg, names);
+    }
+  } else if constexpr(std::is_same_v<Decayed, Expression>) {
+    std::visit(
+      [&](auto const& nested) {
+        collectAllSymbolNamesValue(nested, names);
+      },
+      value);
+  }
+}
+
+static Symbol generateUniqueLocalSymbol(std::unordered_set<std::string>& usedNames) {
+  while(true) {
+    std::string candidate = "__boss_wal_local_"s +
+                            std::to_string(nextGeneratedLocalId++);
+    if(usedNames.find(candidate) != usedNames.end()) {
+      continue;
+    }
+    if(columnNameIntern.find(candidate) != columnNameIntern.end()) {
+      continue;
+    }
+    usedNames.insert(candidate);
+    return Symbol(candidate);
+  }
+}
+
+static std::optional<Symbol> lookupLocalBinding(
+  CanonicalizationContext const& context, Symbol const& symbol) {
+  for(auto it = context.bindings.rbegin(); it != context.bindings.rend(); ++it) {
+    if(it->sourceName == symbol.getName()) {
+      return it->internalName;
+    }
+  }
+  return std::nullopt;
+}
+
+static Expression canonicalizeExpression(
+  Expression expression, CanonicalizationContext& context);
+
+template <typename T>
+static Expression canonicalizeExpressionValue(
+  T&& value, CanonicalizationContext& context) {
+  using Decayed = std::decay_t<T>;
+
+  if constexpr(std::is_same_v<Decayed, Symbol>) {
+    if(auto local = lookupLocalBinding(context, value)) {
+      return *local;
+    }
+
+    addUniqueColumnId(
+      context.referencedCols, internColumnName(value.getName()));
+    if(value == context.targetColumn) {
+      context.targetUse = combineSymbolUse(context.targetUse, SymbolUse::One);
+    }
+    return std::forward<T>(value);
+  } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
+    if(value.getHead() == "Cell"_) {
+      context.hasOpaqueRead = true;
+      if(auto cell = parseLevel1CellReference(value)) {
+        addUniqueCellKey(context.referencedCells, *cell);
+      }
+      return std::forward<T>(value);
+    }
+
+    if(value.getHead() == "Let"_) {
+      context.hasLet = true;
+      if(value.getArguments().size() != 3) {
+        context.lexicallyValid = false;
+        return std::forward<T>(value);
+      }
+
+      auto binderArgument = value.cloneArgument(0);
+      auto const* binderSymbol = get_if<Symbol>(&binderArgument);
+      if(!binderSymbol) {
+        context.lexicallyValid = false;
+        return std::forward<T>(value);
+      }
+      std::string sourceBinderName = binderSymbol->getName();
+
+      auto [head, statics, dynamics, spans] = std::move(value).decompose();
+      if(dynamics.size() != 3) {
+        context.lexicallyValid = false;
+        return ComplexExpression(
+          std::move(head), std::move(statics), std::move(dynamics), std::move(spans));
+      }
+
+      Expression initializer = canonicalizeExpression(
+        std::move(dynamics[1]), context);
+      Symbol internalBinder = generateUniqueLocalSymbol(context.usedNames);
+      context.bindings.push_back({sourceBinderName, internalBinder});
+      Expression body = canonicalizeExpression(std::move(dynamics[2]), context);
+      context.bindings.pop_back();
+
+      boss::ExpressionArguments letArguments;
+      letArguments.reserve(3);
+      letArguments.push_back(internalBinder);
+      letArguments.push_back(std::move(initializer));
+      letArguments.push_back(std::move(body));
+      return ComplexExpression(
+        std::move(head), std::move(statics), std::move(letArguments), std::move(spans));
+    }
+
+    auto [head, statics, dynamics, spans] = std::move(value).decompose();
+    for(auto& argument : dynamics) {
+      argument = canonicalizeExpression(std::move(argument), context);
+    }
+    return ComplexExpression(
+      std::move(head), std::move(statics), std::move(dynamics), std::move(spans));
+  } else if constexpr(std::is_same_v<Decayed, Expression>) {
+    return canonicalizeExpression(std::move(value), context);
+  } else {
+    return std::forward<T>(value);
+  }
+}
+
+static Expression canonicalizeExpression(
+  Expression expression, CanonicalizationContext& context) {
+  return std::visit(
+    [&](auto& value) -> Expression {
+      return canonicalizeExpressionValue(std::move(value), context);
+    },
+    expression);
+}
+
+static CanonicalValueExpression canonicalizeValueExpression(
+  Expression valueExpr, Symbol const& targetColumn) {
+  CanonicalizationContext context{targetColumn};
+  std::visit(
+    [&](auto const& value) {
+      collectAllSymbolNamesValue(value, context.usedNames);
+    },
+    valueExpr);
+
+  Expression canonical = canonicalizeExpression(std::move(valueExpr), context);
+  if(!context.lexicallyValid) {
+    context.targetUse = SymbolUse::Many;
+    context.referencedCols = collectReferencedColumnIds(canonical);
+    context.referencedCells = collectReferencedCellKeys(canonical);
+  }
+
+  bool isBlind = context.lexicallyValid &&
+                 !context.hasOpaqueRead &&
+                 context.referencedCols.empty() &&
+                 context.referencedCells.empty();
+  return {
+    std::move(canonical),
+    isBlind,
+    context.targetUse,
+    context.hasLet,
+    context.lexicallyValid,
+    std::move(context.referencedCols),
+    std::move(context.referencedCells)
+  };
 }
 
 static void registerReverseDependency(RowBucket& bucket,
@@ -1583,7 +2149,7 @@ static bool isBlindSharedAssignment(OperationId opId, int32_t colId) {
 }
 
 static bool bucketHasPendingWork(RowBucket const& bucket) {
-  if(bucket.deleteEntry.has_value()) {
+  if(bucket.insertEntry.has_value() || bucket.deleteEntry.has_value()) {
     return true;
   }
   for(auto const& col : bucket.columnEntries) {
@@ -1633,13 +2199,35 @@ static Expression substituteAndFoldValue(T&& value,
     }
     return value;
   } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
+    if(value.getHead() == "Cell"_) {
+      return std::move(value);
+    }
+
     auto [head, statics, dynamics, spans] = std::move(value).decompose();
     boss::ExpressionArguments newArgs;
     newArgs.reserve(dynamics.size());
-    for(auto& arg : dynamics) {
-      newArgs.push_back(substituteAndFold(std::move(arg), colName, replacement, moved));
+
+    if(head == "Let"_ && dynamics.size() == 3) {
+      Expression binder = std::move(dynamics[0]);
+      auto const* binderSymbol = get_if<Symbol>(&binder);
+      bool shadowsTarget = binderSymbol && *binderSymbol == colName;
+      newArgs.push_back(std::move(binder));
+      newArgs.push_back(substituteAndFold(
+        std::move(dynamics[1]), colName, replacement, moved));
+      if(shadowsTarget) {
+        newArgs.push_back(std::move(dynamics[2]));
+      } else {
+        newArgs.push_back(substituteAndFold(
+          std::move(dynamics[2]), colName, replacement, moved));
+      }
+    } else {
+      for(auto& arg : dynamics) {
+        newArgs.push_back(substituteAndFold(
+          std::move(arg), colName, replacement, moved));
+      }
     }
-    Expression rebuilt = ComplexExpression(head, {}, std::move(newArgs), {});
+    Expression rebuilt = ComplexExpression(
+      std::move(head), std::move(statics), std::move(newArgs), std::move(spans));
 
     // V2M: apply constant folding immediately during recursive substitution.
     return simplifyConstantFold(std::move(rebuilt));
@@ -1660,31 +2248,79 @@ static Expression substituteAndFold(Expression expr,
   }, expr);
 }
 
-static std::optional<Expression> foldColumnValues(Symbol const& colName,
-                                                  Expression earlierValueExpr,
-                                                  Expression laterValueExpr) {
-  // earlierValueExpr = Plus(price, 1)
-  // laterValueExpr   = Plus(price, 1)
-  //
-  // result:
-  // substitute price in laterValueExpr with earlierValueExpr
-  // => Plus(Plus(price, 1), 1)
+static Expression replaceFreeTargetWithLocal(
+  Expression expression, Symbol const& target, Symbol const& local);
 
-  SymbolUse replacementUse = classifySymbolUse(laterValueExpr, colName);
-  if(replacementUse == SymbolUse::Zero) {
-    return std::move(laterValueExpr);
+template <typename T>
+static Expression replaceFreeTargetWithLocalValue(
+  T&& value, Symbol const& target, Symbol const& local) {
+  using Decayed = std::decay_t<T>;
+
+  if constexpr(std::is_same_v<Decayed, Symbol>) {
+    return value == target ? Expression(local) : Expression(std::forward<T>(value));
+  } else if constexpr(std::is_same_v<Decayed, ComplexExpression>) {
+    if(value.getHead() == "Cell"_) {
+      return std::move(value);
+    }
+
+    auto [head, statics, dynamics, spans] = std::move(value).decompose();
+    boss::ExpressionArguments rewritten;
+    rewritten.reserve(dynamics.size());
+
+    if(head == "Let"_ && dynamics.size() == 3) {
+      Expression binder = std::move(dynamics[0]);
+      auto const* binderSymbol = get_if<Symbol>(&binder);
+      bool shadowsTarget = binderSymbol && *binderSymbol == target;
+      rewritten.push_back(std::move(binder));
+      rewritten.push_back(replaceFreeTargetWithLocal(
+        std::move(dynamics[1]), target, local));
+      if(shadowsTarget) {
+        rewritten.push_back(std::move(dynamics[2]));
+      } else {
+        rewritten.push_back(replaceFreeTargetWithLocal(
+          std::move(dynamics[2]), target, local));
+      }
+    } else {
+      for(auto& argument : dynamics) {
+        rewritten.push_back(replaceFreeTargetWithLocal(
+          std::move(argument), target, local));
+      }
+    }
+
+    return ComplexExpression(
+      std::move(head), std::move(statics), std::move(rewritten), std::move(spans));
+  } else if constexpr(std::is_same_v<Decayed, Expression>) {
+    return replaceFreeTargetWithLocal(std::move(value), target, local);
+  } else {
+    return std::forward<T>(value);
   }
+}
 
-  if(replacementUse == SymbolUse::Many) {
-    return std::nullopt;
-  }
-  bool earlierValueMoved = false;
+static Expression replaceFreeTargetWithLocal(
+  Expression expression, Symbol const& target, Symbol const& local) {
+  return std::visit(
+    [&](auto& value) -> Expression {
+      return replaceFreeTargetWithLocalValue(
+        std::move(value), target, local);
+    },
+    expression);
+}
 
-  Expression foldedValue = substituteAndFold(
-    std::move(laterValueExpr), colName, earlierValueExpr, earlierValueMoved);
+static Expression composeWithLet(
+  Symbol const& targetColumn,
+  Expression earlierValue,
+  Expression laterValue) {
+  std::unordered_set<std::string> noLocalCollisions;
+  Symbol local = generateUniqueLocalSymbol(noLocalCollisions);
+  Expression body = replaceFreeTargetWithLocal(
+    std::move(laterValue), targetColumn, local);
 
-  // top-level constant fold (inner nodes already folded by substituteAndFoldValue)
-  return simplifyConstantFold(std::move(foldedValue));
+  boss::ExpressionArguments arguments;
+  arguments.reserve(3);
+  arguments.push_back(local);
+  arguments.push_back(std::move(earlierValue));
+  arguments.push_back(std::move(body));
+  return ComplexExpression("Let"_, {}, std::move(arguments), {});
 }
 
 // ============================================================
@@ -1696,11 +2332,129 @@ static std::optional<Expression> foldColumnValues(Symbol const& colName,
 // For Delete: store as deleteEntry — not in any column vector
 // O(c) per write — one push per column in Set(...)
 
+template <typename T>
+static bool isSupportedInsertPrimitive(T const& value) {
+  using V = std::decay_t<T>;
+  if constexpr(std::is_same_v<V, Expression>) {
+    return get_if<int32_t>(&value) ||
+           get_if<int64_t>(&value) ||
+           get_if<float>(&value) ||
+           get_if<double>(&value) ||
+           get_if<std::string>(&value);
+  } else {
+    return std::is_same_v<V, int32_t> ||
+           std::is_same_v<V, int64_t> ||
+           std::is_same_v<V, float> ||
+           std::is_same_v<V, double> ||
+           std::is_same_v<V, std::string>;
+  }
+}
+
+static bool captureInsert(ComplexExpression& insertExpression) {
+  auto const& args = insertExpression.getArguments();
+  if(args.size() < 2) {
+    return false;
+  }
+
+  auto const& tableArg = args[0];
+  auto const& firstColumnArg = args[1];
+  auto const* tableSymbol = get_if<Symbol>(&tableArg);
+  auto const* firstColumn = get_if<ComplexExpression>(&firstColumnArg);
+  if(!tableSymbol || !firstColumn || firstColumn->getArguments().size() != 1) {
+    return false;
+  }
+
+  RowID rowId = int64_t{0};
+  bool hasNumericRowId = visitArgumentByReference(
+    firstColumn->getArguments()[0],
+    [&](auto const& value) {
+      using V = std::decay_t<decltype(value)>;
+      if constexpr(std::is_same_v<V, int32_t> || std::is_same_v<V, int64_t>) {
+        rowId = value;
+        return true;
+      } else if constexpr(std::is_same_v<V, Expression>) {
+        if(auto const* id32 = get_if<int32_t>(&value)) {
+          rowId = *id32;
+          return true;
+        }
+        if(auto const* id64 = get_if<int64_t>(&value)) {
+          rowId = *id64;
+          return true;
+        }
+      }
+      return false;
+    });
+  if(!hasNumericRowId) {
+    return false;
+  }
+
+  // Validate the complete expression before mutating intern tables or WAL
+  // state. Step 1 accepts only col(concretePrimitive) assignments.
+  for(size_t i = 1; i < args.size(); ++i) {
+    auto const& columnArg = args[i];
+    auto const* column = get_if<ComplexExpression>(&columnArg);
+    if(!column || column->getArguments().size() != 1) {
+      return false;
+    }
+    bool supported = visitArgumentByReference(
+      column->getArguments()[0],
+      [](auto const& value) { return isSupportedInsertPrimitive(value); });
+    if(!supported) {
+      return false;
+    }
+  }
+
+  int32_t tableId = internTableName(tableSymbol->getName());
+  int32_t idColumnId = internColumnName(firstColumn->getHead().getName());
+  WALKey key{tableId, toInt64(rowId)};
+
+  auto [insertHead, insertStatics, insertDynamics, insertSpans] =
+    std::move(insertExpression).decompose();
+
+  std::vector<InsertAssignment> assignments;
+  assignments.reserve(insertDynamics.size() - 1);
+  for(size_t i = 1; i < insertDynamics.size(); ++i) {
+    Expression columnExpression = std::move(insertDynamics[i]);
+    auto* column = get_if<ComplexExpression>(&columnExpression);
+    if(!column) {
+      return false;
+    }
+    auto [columnHead, columnStatics, columnDynamics, columnSpans] =
+      std::move(*column).decompose();
+    assignments.push_back({
+      internColumnName(columnHead.getName()),
+      std::move(columnDynamics[0])
+    });
+  }
+
+  auto [bucketIt, inserted] = tryEmplaceBucket(key);
+  RowBucket& bucket = bucketIt->second;
+  if(inserted) {
+    bucket.tableId = tableId;
+    bucket.rowId = rowId;
+  }
+  bucket.idColumnId = idColumnId;
+
+  int seq = globalNextSeq++;
+  bool replacingPendingInsert = bucket.insertEntry.has_value();
+  bucket.insertEntry = InsertEntry{seq, std::move(assignments)};
+  pendingInsertQueue.push_back(PendingInsertHandle{key, seq});
+  if(!replacingPendingInsert) {
+    walTotalEntries++;
+    pendingInsertRows++;
+    recordPendingInsertCapture();
+  }
+  #if BOSS_WAL_INSTRUMENTATION
+  walStats.walEntriesCreated++;
+  #endif
+  return true;
+}
+
 static void walIndexPush(WALKey const& key, Expression walEntry) {
   // Create bucket if this is the first entry for this row.
   // V2J: use try_emplace to avoid find(key) followed by walIndex[key],
   // which performs repeated hash-table lookup work.
-  auto [bucketIt, inserted] = walIndex.try_emplace(key);
+  auto [bucketIt, inserted] = tryEmplaceBucket(key);
 
   RowBucket& bucket = bucketIt->second;
   if(inserted) {
@@ -1737,36 +2491,34 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
 
             std::string colName = colHead.getName();
             int32_t colId = internColumnName(colName);
-            Expression valueExpr = std::move(colDynamics[0]);
-
-            bool blind = isBlindValueWrite(valueExpr);
-            auto referencedCols = collectReferencedColumnIds(valueExpr);
-            auto referencedCells = collectReferencedCellKeys(valueExpr);
+            auto canonical = canonicalizeValueExpression(
+              std::move(colDynamics[0]), columnIdToSymbol[colId]);
 
             int seq = globalNextSeq++;
 
-            auto [colPtr2, colInserted] = bucket.columnEntries.try_emplace(colId);
+            auto* colPtr2 = bucket.columnEntries.try_emplace(colId).first;
             if(!colPtr2) continue; // too many columns (>N) — should not happen for OLTP
             auto& colEntries = colPtr2->entries;
 
-            if(colInserted) {
-              colEntries.reserve(WAL_COLUMN_ENTRY_RESERVE);
-            }
-
+            reserveHotColumnIfNeeded(colEntries);
             colEntries.push_back(WALEntry{
-              std::move(valueExpr),
+              std::move(canonical.valueExpr),
               seq,
-              blind,
-              referencedCols,
-              referencedCells
+              canonical.isBlindWrite,
+              canonical.referencedCols,
+              canonical.referencedCells,
+              canonical.targetUse,
+              canonical.hasLet,
+              canonical.lexicallyValid
             });
-            registerReverseDependencies(bucket, colId, seq, referencedCols);
-            registerBucketDependencySummary(bucket, colId, referencedCols, referencedCells);
+            registerReverseDependencies(bucket, colId, seq, canonical.referencedCols);
+            registerBucketDependencySummary(
+              bucket, colId, canonical.referencedCols, canonical.referencedCells);
             registerCellReverseDependencies(
               bucket,
               colId,
               seq,
-              referencedCells);
+              canonical.referencedCells);
             walTotalEntries++; // once per column, not once per Update
             #if BOSS_WAL_INSTRUMENTATION
             walStats.walEntriesCreated++;
@@ -1816,13 +2568,9 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
 // without needing to substitute concrete values here.
 
 // Result of folding one column's entry list.
-// foldedValue: the combined expression for the entries that were safely folded
-//              (newest entry down to the fold break point, or all entries).
-// pendingEntries: entries that could NOT be safely folded in (oldest first).
-//   These arise when an expression has the column symbol more than once —
-//   folding such an entry would substitute the accumulated expression into
-//   multiple positions, causing exponential tree growth.
-//   Callers must emit these as separate ordered Updates before the merged one.
+// foldedValue: the combined expression for the valid composable suffix.
+// pendingEntries: malformed lexical entries and anything before them, oldest
+// first. Callers emit these as ordered Updates before the composable suffix.
 struct ColumnFoldResult {
   std::optional<Expression> foldedValue;
   std::vector<WALEntry> pendingEntries;
@@ -1836,14 +2584,16 @@ static ColumnFoldResult resolveColumnEntries(
   std::function<void(int32_t, WALEntry const&)> const* beforeApplyEntry = nullptr)
 {
   Symbol const& colSym = columnIdToSymbol[colId];
-  std::optional<Expression> resolvedValue;
+  int resetSeq = latestColumnResetSeq(bucket, cutoffSeq);
+  size_t selectedBegin = 0;
+  size_t selectedEnd = 0;
+  bool hasSelection = false;
 
   for(int idx = static_cast<int>(entries.size()) - 1; idx >= 0; idx--) {
     WALEntry& walEntry = entries[idx];
 
     if(walEntry.seq > cutoffSeq) continue;
-
-    if(bucket.deleteEntry.has_value() && walEntry.seq <= bucket.deleteEntry->seq) {
+    if(walEntry.seq <= resetSeq) {
       break;
     }
 
@@ -1851,60 +2601,70 @@ static ColumnFoldResult resolveColumnEntries(
       (*beforeApplyEntry)(colId, walEntry);
     }
 
-    if(!resolvedValue.has_value()) {
-      if(walEntry.isBlindWrite) {
-        resolvedValue = std::move(walEntry.valueExpr);
-        break;
-      } else {
-        resolvedValue = std::move(walEntry.valueExpr);
-      }
-    } else {
-      // Before folding this (older) entry into the accumulated (newer) value,
-      // check if the fold would cause exponential expression growth.
-      //
-      // foldColumnValues substitutes colSym in resolvedValue with walEntry.valueExpr.
-      // If resolvedValue has K occurrences and walEntry has M occurrences, the result
-      // has K*M occurrences. Folding is safe only when both K ≤ 1 and M ≤ 1.
-      //
-      // Blind writes have 0 occurrences of colSym, but the accumulated newer
-      // expression can still be a multi-use boundary such as Plus(price, price).
-      SymbolUse k = classifySymbolUse(*resolvedValue, colSym);
-      SymbolUse m = walEntry.isBlindWrite ? SymbolUse::Zero
-                                          : classifySymbolUse(walEntry.valueExpr, colSym);
-      if(k == SymbolUse::Many || m == SymbolUse::Many) {
-        // Collect entries 0..idx (oldest first) as pending — they were not moved.
-        std::vector<WALEntry> pending;
-        for(int j = 0; j <= idx; j++) {
-          WALEntry& e = entries[j];
-          if(e.seq > cutoffSeq) continue;
-          if(bucket.deleteEntry.has_value() && e.seq <= bucket.deleteEntry->seq) continue;
-          pending.push_back(std::move(e));
-        }
-        return {std::move(resolvedValue), std::move(pending)};
-      }
-
-      if(walEntry.isBlindWrite) {
-        auto folded = foldColumnValues(
-          colSym,
-          std::move(walEntry.valueExpr),
-          std::move(*resolvedValue)
-        );
-        if(!folded.has_value()) return {std::move(resolvedValue), {}};
-        resolvedValue = std::move(*folded);
-        break;
-      } else {
-        auto folded = foldColumnValues(
-          colSym,
-          std::move(walEntry.valueExpr),
-          std::move(*resolvedValue)
-        );
-        if(!folded.has_value()) return {std::move(resolvedValue), {}};
-        resolvedValue = std::move(*folded);
-      }
+    if(!hasSelection) {
+      selectedEnd = static_cast<size_t>(idx) + 1;
+      hasSelection = true;
+    }
+    selectedBegin = static_cast<size_t>(idx);
+    if(walEntry.isBlindWrite) {
+      break;
     }
   }
 
-  return {std::move(resolvedValue), {}};
+  if(!hasSelection) {
+    return {};
+  }
+
+  size_t foldStart = selectedBegin;
+  std::vector<WALEntry> pending;
+  std::optional<size_t> newestInvalid;
+  for(size_t i = selectedBegin; i < selectedEnd; ++i) {
+    if(!entries[i].lexicallyValid) {
+      newestInvalid = i;
+    }
+  }
+
+  if(newestInvalid.has_value()) {
+    if(*newestInvalid + 1 == selectedEnd) {
+      pending.reserve(*newestInvalid - selectedBegin);
+      for(size_t i = selectedBegin; i < *newestInvalid; ++i) {
+        pending.push_back(std::move(entries[i]));
+      }
+      return {
+        std::move(entries[*newestInvalid].valueExpr),
+        std::move(pending)
+      };
+    }
+
+    pending.reserve(*newestInvalid - selectedBegin + 1);
+    for(size_t i = selectedBegin; i <= *newestInvalid; ++i) {
+      pending.push_back(std::move(entries[i]));
+    }
+    foldStart = *newestInvalid + 1;
+  }
+
+  std::optional<Expression> resolvedValue;
+  for(size_t i = foldStart; i < selectedEnd; ++i) {
+    WALEntry& entry = entries[i];
+    if(!resolvedValue.has_value() || entry.targetUse == SymbolUse::Zero) {
+      resolvedValue = std::move(entry.valueExpr);
+      continue;
+    }
+
+    if(entry.targetUse == SymbolUse::One) {
+      Expression earlierValue = std::move(*resolvedValue);
+      bool earlierValueMoved = false;
+      Expression composed = substituteAndFold(
+        std::move(entry.valueExpr), colSym, earlierValue, earlierValueMoved);
+      resolvedValue = simplifyConstantFold(std::move(composed));
+      continue;
+    }
+
+    resolvedValue = composeWithLet(
+      colSym, std::move(*resolvedValue), std::move(entry.valueExpr));
+  }
+
+  return {std::move(resolvedValue), std::move(pending)};
 }
 
 static ColumnFoldResult resolveColumnEntries(
@@ -1955,18 +2715,19 @@ static std::vector<Expression> materialiseLocalEntries(RowBucket const& bucket,
 
 static std::vector<Expression> materialiseLocalRefSegment(RowBucket const& bucket,
                                                           int32_t colId,
-                                                          std::vector<WALEntry> entries) {
+                                                          std::vector<WALEntry> entries,
+                                                          int cutoffSeq = std::numeric_limits<int>::max()) {
   std::vector<Expression> result;
   if(entries.empty()) {
     return result;
   }
 
   auto foldResult = resolveColumnEntries(
-    std::move(entries), bucket, std::numeric_limits<int>::max(), colId);
+    std::move(entries), bucket, cutoffSeq, colId);
 
   if(!foldResult.pendingEntries.empty()) {
     auto pendingUpdates = materialiseLocalRefSegment(
-      bucket, colId, std::move(foldResult.pendingEntries));
+      bucket, colId, std::move(foldResult.pendingEntries), cutoffSeq);
     for(auto& update : pendingUpdates) {
       result.push_back(std::move(update));
     }
@@ -1989,7 +2750,8 @@ static std::vector<Expression> materialiseLocalEntries(RowBucket const& bucket,
 
 static std::vector<Expression> materialiseLocalRefSegment(RowBucket& bucket,
                                                           int32_t colId,
-                                                          std::vector<WALColumnEntry> columnEntries) {
+                                                          std::vector<WALColumnEntry> columnEntries,
+                                                          int cutoffSeq = std::numeric_limits<int>::max()) {
   std::vector<WALEntry> entries;
   entries.reserve(columnEntries.size());
   for(auto& entry : columnEntries) {
@@ -2008,7 +2770,7 @@ static std::vector<Expression> materialiseLocalRefSegment(RowBucket& bucket,
     }
   }
 
-  return materialiseLocalRefSegment(bucket, colId, std::move(entries));
+  return materialiseLocalRefSegment(bucket, colId, std::move(entries), cutoffSeq);
 }
 
 static void discardLocalRefSegment(RowBucket& bucket,
@@ -2099,9 +2861,14 @@ static std::vector<Expression> materialiseSharedBoundary(OperationId opId) {
     assignmentBlindness.push_back(assignment.isBlindWrite);
   }
   size_t liveRefCount = opIt->second.liveRefCount;
+  int operationSeq = opIt->second.seqBase;
 
   for(auto const& rowId : rowIds) {
     WALKey key{tableId, toInt64(rowId)};
+    auto bucketIt = walIndex.find(key);
+    if(bucketIt != walIndex.end()) {
+      materialisePendingInsertBefore(bucketIt->second, operationSeq - 1, result);
+    }
     for(size_t ai = 0; ai < colIds.size(); ++ai) {
       auto prefixMode = assignmentBlindness[ai]
         ? LocalSegmentMode::Discard
@@ -2172,10 +2939,25 @@ static std::vector<Expression> materialiseColumnChainUntil(
       }
     }
 
+    // Let the shared boundary advance all of its rows, including this row's
+    // local prefix. This ensures an earlier insert is emitted before local
+    // entries between the insert and the shared operation. The recursive
+    // stopBeforeOp calls below consume the prefix without re-entering here.
+    if(!stopBeforeOp.has_value() && boundaryOp.has_value()) {
+      auto sharedUpdates = materialiseSharedBoundary(*boundaryOp);
+      for(auto& update : sharedUpdates) {
+        result.push_back(std::move(update));
+      }
+      continue;
+    }
+
     std::vector<WALColumnEntry> segment(
       std::make_move_iterator(entries.begin()),
       std::make_move_iterator(entries.begin() + boundaryIndex));
     size_t segmentSize = segment.size();
+    int segmentCutoffSeq = boundaryIndex < entries.size()
+      ? getColumnEntrySeq(entries[boundaryIndex]) - 1
+      : std::numeric_limits<int>::max();
     if(!segment.empty()) {
       auto effectiveLocalMode = localMode;
       if(boundaryOp.has_value() && isBlindSharedAssignment(*boundaryOp, colId)) {
@@ -2183,7 +2965,8 @@ static std::vector<Expression> materialiseColumnChainUntil(
       }
 
       if(effectiveLocalMode == LocalSegmentMode::Emit) {
-        auto localUpdates = materialiseLocalRefSegment(bucket, colId, std::move(segment));
+        auto localUpdates = materialiseLocalRefSegment(
+          bucket, colId, std::move(segment), segmentCutoffSeq);
         for(auto& update : localUpdates) {
           result.push_back(std::move(update));
         }
@@ -2205,14 +2988,6 @@ static std::vector<Expression> materialiseColumnChainUntil(
         : std::get_if<WALEntryRef>(&entries.front());
       if(frontRef && frontRef->opId == *stopBeforeOp) {
         return result;
-      }
-      continue;
-    }
-
-    if(boundaryOp.has_value()) {
-      auto sharedUpdates = materialiseSharedBoundary(*boundaryOp);
-      for(auto& update : sharedUpdates) {
-        result.push_back(std::move(update));
       }
       continue;
     }
@@ -2311,8 +3086,8 @@ static std::optional<int> latestLocalSeqBefore(RowBucket const& bucket,
 }
 
 static bool overwritesOwnColumn(WALEntry const& entry, int32_t colId) {
-  Symbol const& colSym = columnIdToSymbol[colId];
-  return classifySymbolUse(entry.valueExpr, colSym) == SymbolUse::Zero;
+  (void)colId;
+  return entry.targetUse == SymbolUse::Zero;
 }
 
 static std::vector<EntryHandle> collectRelevantEntriesForColumnCutoff(
@@ -2835,6 +3610,22 @@ struct CellDependencyFlushContext {
 
     processing.push_back({cell, cutoffSeq});
 
+    // InsertInto is the base state for every cell in its row. Advance any
+    // earlier history first, then materialise the complete row before later
+    // writers or readers of this cell are allowed to proceed.
+    auto* lifecycleBucket = findBucketMutable(cell);
+    if(lifecycleBucket && lifecycleBucket->insertEntry.has_value() &&
+       lifecycleBucket->insertEntry->seq <= cutoffSeq) {
+      int insertSeq = lifecycleBucket->insertEntry->seq;
+      ensureCellReady(cell, insertSeq - 1);
+
+      lifecycleBucket = findBucketMutable(cell);
+      if(lifecycleBucket &&
+         materialisePendingInsertBefore(*lifecycleBucket, cutoffSeq, emitted)) {
+        markTouched(cell);
+      }
+    }
+
     auto readers = readersOfCellBefore(cell, cutoffSeq + 1);
     for(auto const& reader : readers) {
       ensureCellReady(cell, reader.seq - 1);
@@ -2854,7 +3645,7 @@ struct CellDependencyFlushContext {
     for(auto const& key : touchedKeys) {
       auto bucketIt = walIndex.find(key);
       if(bucketIt != walIndex.end() && !bucketHasPendingWork(bucketIt->second)) {
-        walIndex.erase(bucketIt);
+        eraseBucket(bucketIt);
       }
     }
   }
@@ -3144,7 +3935,12 @@ struct ResolvedCol {
   Expression valueExpr;
   int latestSeq;
   bool isBlind;
-  std::vector<WALEntry> pendingEntries; // entries that couldn't be safely folded, oldest first
+  SymbolUse targetUse;
+  bool hasLet;
+  bool lexicallyValid;
+  std::vector<int32_t> referencedCols;
+  std::vector<CellKey> referencedCells;
+  std::vector<WALEntry> pendingEntries; // malformed lexical boundary prefix, oldest first
 };
 
 struct BucketResolution {
@@ -3152,20 +3948,23 @@ struct BucketResolution {
   int maxSeq;
 };
 
-static BucketResolution resolveBucketColumns(RowBucket& bucket) {
-  // deleteSeq: entries at or before this seq are discarded
-  int deleteSeq = bucket.deleteEntry.has_value() ? bucket.deleteEntry->seq : -1;
+static BucketResolution resolveBucketColumns(
+  RowBucket& bucket,
+  std::function<void(int32_t, WALEntry const&)> const* beforeApplyEntry = nullptr) {
+  // Entries at or before the latest row reset cannot contribute to the
+  // current row state. InsertInto is a lazy reset boundary just like Delete.
+  int resetSeq = latestColumnResetSeq(bucket);
 
   // Single pass: compute global maxSeq and per-column colLatestSeq together,
   // avoiding a separate first pass just for maxSeq.
-  int maxSeq = deleteSeq;
+  int maxSeq = resetSeq;
   int colLatestSeqs[InlineColVec::N];
   std::fill(colLatestSeqs, colLatestSeqs + InlineColVec::N, -1);
 
   for(int ci = 0; ci < bucket.columnEntries.size; ++ci) {
     for(auto const& e : bucket.columnEntries.data[ci].entries) {
       int seq = getColumnEntrySeq(e);
-      if(seq > deleteSeq) {
+      if(seq > resetSeq) {
         if(seq > maxSeq) maxSeq = seq;
         if(seq > colLatestSeqs[ci]) colLatestSeqs[ci] = seq;
       }
@@ -3181,24 +3980,31 @@ static BucketResolution resolveBucketColumns(RowBucket& bucket) {
           discardColumnEntryRef(*ref);
         }
       }
-      continue; // all entries before delete, skip
+      continue; // all entries are at or before the latest row reset
     }
 
     int32_t colId = bucket.columnEntries.data[ci].colId;
     auto& entries = bucket.columnEntries.data[ci].entries;
 
-    auto foldResult = resolveColumnEntries(entries, bucket, maxSeq, colId);
+    auto foldResult = resolveColumnEntries(
+      entries, bucket, maxSeq, colId, beforeApplyEntry);
     if(!foldResult.foldedValue.has_value()) continue;
 
     Symbol const& colSym = columnIdToSymbol[colId];
-    bool blind = isBlindValueWrite(*foldResult.foldedValue);
+    auto canonical = canonicalizeValueExpression(
+      std::move(*foldResult.foldedValue), colSym);
 
     resolved.push_back({
       colId,
       colSym,
-      std::move(*foldResult.foldedValue),
+      std::move(canonical.valueExpr),
       colLatestSeqs[ci],
-      blind,
+      canonical.isBlindWrite,
+      canonical.targetUse,
+      canonical.hasLet,
+      canonical.lexicallyValid,
+      std::move(canonical.referencedCols),
+      std::move(canonical.referencedCells),
       std::move(foldResult.pendingEntries)
     });
   }
@@ -3260,19 +4066,23 @@ static void optimiseBucketImpl(RowBucket& bucket) {
         pe.seq,
         pe.isBlindWrite,
         std::move(pe.referencedCols),
-        std::move(pe.referencedCells)
+        std::move(pe.referencedCells),
+        pe.targetUse,
+        pe.hasLet,
+        pe.lexicallyValid
       });
     }
 
     // Keep latestSeq so flushBucket can emit columns in dependency-safe order.
-    auto referencedCols = collectReferencedColumnIds(rc.valueExpr);
-    auto referencedCells = collectReferencedCellKeys(rc.valueExpr);
     colEntries.push_back(WALEntry{
       std::move(rc.valueExpr),
       rc.latestSeq,
       rc.isBlind,
-      std::move(referencedCols),
-      std::move(referencedCells)
+      std::move(rc.referencedCols),
+      std::move(rc.referencedCells),
+      rc.targetUse,
+      rc.hasLet,
+      rc.lexicallyValid
     });
   }
 
@@ -3332,22 +4142,39 @@ static std::optional<Expression> buildUpdateFromResolvedColumns(
 static std::vector<Expression> flushBucket(
   WALKey const& key,
   std::vector<std::string> const& columns = {},
-  FlushReason reason = FlushReason::Other)
+  FlushReason reason = FlushReason::Other,
+  ReadBucketObservation* readObservation = nullptr)
 {
   auto it = walIndex.find(key);
-  if(it == walIndex.end()) return {};
+  if(it == walIndex.end()) {
+    if(readObservation) readObservation->found = false;
+    return {};
+  }
 
   RowBucket& bucket = it->second;
+  if(readObservation) {
+    readObservation->found = true;
+    readObservation->hasInsert = bucket.insertEntry.has_value();
+    readObservation->hasDelete = bucket.deleteEntry.has_value();
+    readObservation->hasColumnUpdates = !bucket.columnEntries.empty();
+    readObservation->hasSameRowDependencies =
+      bucket.pendingSameRowCrossColumnEntries > 0;
+    readObservation->hasCrossRowDependencies =
+      bucket.pendingCrossRowCellEntries > 0;
+    readObservation->columnCount =
+      static_cast<size_t>(bucket.columnEntries.size);
+  }
   std::vector<Expression> result;
 
-  // If a row-level Delete is pending, a column-selective flush is not safe.
-  // A Delete affects the whole row, so force this to become a whole-row flush.
+  // Row-level lifecycle operations cannot be selectively materialised. An
+  // insert must create the complete row, and a delete affects the whole row.
   std::vector<std::string> effectiveColumns = columns;
-  if(bucket.deleteEntry.has_value()) {
+  if(bucket.insertEntry.has_value() || bucket.deleteEntry.has_value()) {
     effectiveColumns.clear();
   }
 
   bool flushingAllColumns = effectiveColumns.empty();
+  if(readObservation) readObservation->columnSelective = !flushingAllColumns;
 
   // Count the whole bucket before resolution.
   // This is needed for walTotalEntries accounting because resolveBucketColumns()
@@ -3355,6 +4182,9 @@ static std::vector<Expression> flushBucket(
   size_t countBeforeAll = 0;
   for(auto const& col : bucket.columnEntries) {
     countBeforeAll += col.entries.size();
+  }
+  if(bucket.insertEntry.has_value()) {
+    countBeforeAll++;
   }
   if(bucket.deleteEntry.has_value()) {
     countBeforeAll++;
@@ -3375,6 +4205,7 @@ static std::vector<Expression> flushBucket(
       }
     }
   }
+  if(readObservation) readObservation->entriesFlushed = countBeforeFlushed;
 
   recordFlushStart(reason, countBeforeFlushed);
 
@@ -3402,15 +4233,19 @@ static std::vector<Expression> flushBucket(
       }
     }
 
-    if(bucket.deleteEntry.has_value() && flushingAllColumns) {
-      result.push_back(buildDeleteExpression(bucket));
-      if(walTotalEntries > 0) {
+    // Any lifecycle entries still pending here follow every shared boundary
+    // encountered while advancing this row. Earlier inserts are emitted
+    // centrally by materialiseSharedBoundary before that operation's prefixes.
+    if(flushingAllColumns) {
+      bool hadPendingDelete = bucket.deleteEntry.has_value();
+      materialisePendingLifecycle(bucket, result);
+      if(hadPendingDelete && walTotalEntries > 0) {
         walTotalEntries--;
       }
     }
 
     if(flushingAllColumns || !bucketHasPendingWork(bucket)) {
-      walIndex.erase(it);
+      eraseBucket(it);
     }
 
     recordPhysicalExpressions(result);
@@ -3432,7 +4267,7 @@ static std::vector<Expression> flushBucket(
     }
 
     if(!dependencyResult->cleanedTouchedBuckets && !bucketHasPendingWork(bucket)) {
-      walIndex.erase(it);
+      eraseBucket(it);
     }
 
     recordPhysicalExpressions(result);
@@ -3448,18 +4283,44 @@ static std::vector<Expression> flushBucket(
   //     are written into the map only to be read back out and erased again
   // Only columns that need to remain in the bucket afterward are persisted
   // below; columns being flushed now go straight from resolution to output.
-  auto resolution = resolveBucketColumns(bucket);
+  std::optional<CellDependencyFlushContext> fullRowCellContext;
+  std::function<void(int32_t, WALEntry const&)> beforeApplyEntry;
+  if(flushingAllColumns && bucket.pendingCrossRowCellEntries > 0) {
+    fullRowCellContext.emplace();
+    beforeApplyEntry = [&](int32_t, WALEntry const& entry) {
+      for(auto const& referencedCell : entry.referencedCells) {
+        if(rowKeyForCell(referencedCell) == key) {
+          continue;
+        }
+        fullRowCellContext->ensureCellReady(referencedCell, entry.seq - 1);
+      }
+    };
+  }
+
+  auto resolution = resolveBucketColumns(
+    bucket, fullRowCellContext.has_value() ? &beforeApplyEntry : nullptr);
+
+  if(fullRowCellContext.has_value()) {
+    recordDependencyMaterialisation(
+      fullRowCellContext->consumedEntries, fullRowCellContext->emitted);
+    for(auto& prerequisite : fullRowCellContext->emitted) {
+      result.push_back(std::move(prerequisite));
+    }
+    if(walTotalEntries >= fullRowCellContext->consumedEntries) {
+      walTotalEntries -= fullRowCellContext->consumedEntries;
+    } else {
+      walTotalEntries = 0;
+    }
+  }
 
   if(flushingAllColumns) {
     // ── whole-row flush ───────────────────────────────────────────────────
-    // emit Delete first if one exists
-    if(bucket.deleteEntry.has_value()) {
-      result.push_back(buildDeleteExpression(bucket));
-    }
+    size_t insertEntriesAccountedDuringMaterialisation =
+      bucket.insertEntry.has_value() ? 1 : 0;
+    materialisePendingLifecycle(bucket, result);
 
-    // Emit pending entries (unfoldable due to multi-occurrence expressions) as
-    // separate ordered Updates BEFORE the merged one. The in-memory engine will
-    // apply them in sequence, then apply the merged folded state last.
+    // Emit malformed lexical boundary entries as separate ordered Updates
+    // before the valid composed suffix.
     for(auto& rc : resolution.columns) {
       if(!rc.pendingEntries.empty()) {
         auto pendingUpdates = materialiseLocalEntries(
@@ -3479,9 +4340,15 @@ static std::vector<Expression> flushBucket(
 
     // whole-row flush — the bucket (and its columnEntries array) is about to
     // be destroyed entirely, so there is nothing left to persist.
-    walTotalEntries -= countBeforeAll;
+    // materialisePendingInsert() already removed the pending insert from the
+    // global count; bulk-account only for the remaining bucket entries.
+    walTotalEntries -=
+      countBeforeAll - insertEntriesAccountedDuringMaterialisation;
     unregisterAllCellReverseDependencies(bucket);
-    walIndex.erase(it);
+    eraseBucket(it);
+    if(fullRowCellContext.has_value()) {
+      fullRowCellContext->cleanupTouchedBuckets();
+    }
 
   } else {
     // ── column-selective flush ────────────────────────────────────────────
@@ -3543,18 +4410,22 @@ static std::vector<Expression> flushBucket(
           pe.seq,
           pe.isBlindWrite,
           std::move(pe.referencedCols),
-          std::move(pe.referencedCells)
+          std::move(pe.referencedCells),
+          pe.targetUse,
+          pe.hasLet,
+          pe.lexicallyValid
         });
       }
 
-      auto referencedCols = collectReferencedColumnIds(rc.valueExpr);
-      auto referencedCells = collectReferencedCellKeys(rc.valueExpr);
       colEntries.push_back(WALEntry{
         std::move(rc.valueExpr),
         rc.latestSeq,
         rc.isBlind,
-        std::move(referencedCols),
-        std::move(referencedCells)
+        std::move(rc.referencedCols),
+        std::move(rc.referencedCells),
+        rc.targetUse,
+        rc.hasLet,
+        rc.lexicallyValid
       });
     }
     rebuildReverseDependencies(bucket);
@@ -3575,7 +4446,7 @@ static std::vector<Expression> flushBucket(
     // if all columns have been flushed, remove the bucket entirely
     // otherwise leave it alive for the remaining columns
     if(bucket.columnEntries.empty() && !bucket.deleteEntry.has_value()) {
-      walIndex.erase(it);
+      eraseBucket(it);
     }
   }
 
@@ -3583,154 +4454,390 @@ static std::vector<Expression> flushBucket(
   return result;
 }
 // ============================================================
-// extractSelectKeys
+// extractSelectPlan
 // ============================================================
- 
-// extractSelectKeys — get (tableName, rowID) pairs from a Select expression
-//
-// Handles two formats:
-//
-// Format 1: raw Select arriving directly from application (our benchmark pipeline)
-//   Select(Customer, Where(Equal(id, 5)))
-//   → tableName = "Customer" from arg 0 (Symbol)
-//   → rowID = 5 from Equal(id, 5)
-//
-// Format 2: pre-resolved Select with explicit Table (full pipeline with Velox)
-//   Select(Table(Customer, id(List(5, 6))), Where(...))
-//   → tableName = "Customer" from Table arg 0 (Symbol)
-//   → rowIDs from id(List(...))
-//
-// Returns empty vector if neither format matches — caller falls back to full flush.
 
-static std::vector<SelectTarget> extractSelectKeys(ComplexExpression const& expr) {
-  std::vector<SelectTarget> targets;
+// A point read exposes concrete primary keys and flushes only those buckets. A
+// non-primary-key predicate exposes only the table and conservatively flushes
+// pending rows from that table. Unrecognisable shapes retain the global flush
+// fallback used for correctness before this classification existed.
+static void appendRequiredColumn(SelectPlan& plan, std::string const& column) {
+  if(std::find(plan.columns.begin(), plan.columns.end(), column) ==
+     plan.columns.end()) {
+    plan.columns.push_back(column);
+  }
+}
 
-  // ── Format 3: Project(Select(Customer, Where(Equal(id, 5))), As(price_, price_)) ──
-  //
-  // Outermost head is Project — column-selective read
-  // arg 0 is the inner Select expression
-  // arg 1 is As(...) containing pairs of (outputName, inputName)
-  // we extract the row ID from the inner Select and the column names from As(...)
+static bool collectSupportedPredicateColumns(
+  ComplexExpression const& predicate,
+  std::vector<std::string>& columns) {
+  auto const& head = predicate.getHead();
+  auto const& args = predicate.getArguments();
+  if(head == "Equal"_) {
+    if(args.size() != 2) return false;
+    for(auto const& arg : args) {
+      if(auto const* symbol = get_if<Symbol>(&arg)) {
+        if(std::find(columns.begin(), columns.end(), symbol->getName()) ==
+           columns.end()) {
+          columns.push_back(symbol->getName());
+        }
+      }
+    }
+    return true;
+  }
+  if(head != "And"_ || args.empty()) return false;
+  for(auto const& arg : args) {
+    auto const* child = get_if<ComplexExpression>(&arg);
+    if(!child || !collectSupportedPredicateColumns(*child, columns)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static std::optional<std::string> validateTopOneReadShape(
+  ComplexExpression const& expr) {
+  auto const& args = expr.getArguments();
+  if(args.size() != 3) return std::nullopt;
+
+  bool limitIsOne = false;
+  auto const& limitArg = args[2];
+  if(auto const* limit = get_if<int32_t>(&limitArg)) {
+    limitIsOne = *limit == 1;
+  } else if(auto const* limit = get_if<int64_t>(&limitArg)) {
+    limitIsOne = *limit == 1;
+  }
+  if(!limitIsOne) return std::nullopt;
+
+  auto const& projectArg = args[0];
+  auto const* project = get_if<ComplexExpression>(&projectArg);
+  if(!project || project->getHead() != "Project"_ ||
+     project->getArguments().size() != 2) {
+    return std::nullopt;
+  }
+  auto const& projectArgs = project->getArguments();
+  auto const& selectArg = projectArgs[0];
+  auto const& projectionArg = projectArgs[1];
+  auto const* select = get_if<ComplexExpression>(&selectArg);
+  auto const* projection = get_if<ComplexExpression>(&projectionArg);
+  if(!select || select->getHead() != "Select"_ ||
+     select->getArguments().size() != 2 ||
+     !projection || projection->getHead() != "As"_ ||
+     projection->getArguments().empty() ||
+     projection->getArguments().size() % 2 != 0) {
+    return std::nullopt;
+  }
+  for(size_t i = 0; i < projection->getArguments().size(); i += 2) {
+    auto const& outputArg = projection->getArguments()[i];
+    auto const& sourceArg = projection->getArguments()[i + 1];
+    if(!get_if<Symbol>(&outputArg) || !get_if<Symbol>(&sourceArg)) {
+      return std::nullopt;
+    }
+  }
+
+  auto const& selectArgs = select->getArguments();
+  auto const& tableArg = selectArgs[0];
+  auto const& whereArg = selectArgs[1];
+  if(!get_if<Symbol>(&tableArg)) return std::nullopt;
+  auto const* where = get_if<ComplexExpression>(&whereArg);
+  if(!where || where->getHead() != "Where"_ ||
+     where->getArguments().size() != 1) {
+    return std::nullopt;
+  }
+  auto const& predicateArg = where->getArguments()[0];
+  auto const* predicate = get_if<ComplexExpression>(&predicateArg);
+  std::vector<std::string> predicateColumns;
+  if(!predicate ||
+     !collectSupportedPredicateColumns(*predicate, predicateColumns)) {
+    return std::nullopt;
+  }
+
+  auto const& byArg = args[1];
+  auto const* by = get_if<ComplexExpression>(&byArg);
+  if(!by || by->getHead() != "By"_ || by->getArguments().size() != 2) {
+    return std::nullopt;
+  }
+  auto const& orderColumnArg = by->getArguments()[0];
+  auto const& directionArg = by->getArguments()[1];
+  auto const* orderColumn = get_if<Symbol>(&orderColumnArg);
+  auto const* direction = get_if<Symbol>(&directionArg);
+  if(!orderColumn || !direction ||
+     (direction->getName() != "asc" && direction->getName() != "desc")) {
+    return std::nullopt;
+  }
+  return orderColumn->getName();
+}
+
+static SelectPlan extractSelectPlan(ComplexExpression const& expr) {
+  SelectPlan plan;
+
+  if(expr.getHead() == "Top"_) {
+    auto orderColumn = validateTopOneReadShape(expr);
+    if(!orderColumn.has_value()) return plan;
+
+    auto const& projectArg = expr.getArguments()[0];
+    auto const* project = get_if<ComplexExpression>(&projectArg);
+    plan = extractSelectPlan(*project);
+    if(plan.scope == SelectScope::Unknown) return plan;
+    appendRequiredColumn(plan, *orderColumn);
+    return plan;
+  }
+
+  // Project(Select(...), As(...)) preserves the inner read scope. For supported
+  // predicates and projections, the required set is the union of predicate and
+  // projected source columns. Unsupported shapes remain conservative.
   if(expr.getHead() == "Project"_) {
     auto const& args = expr.getArguments();
-    if(args.size() < 2) return targets;
+    if(args.size() < 2) return plan;
 
-    // arg 0 must be a Select expression
     auto const& innerArg = args[0];
     auto const* innerSelect = get_if<ComplexExpression>(&innerArg);
-    if(!innerSelect || innerSelect->getHead() != "Select"_) return targets;
+    if(!innerSelect || innerSelect->getHead() != "Select"_) return plan;
 
-    // arg 1 must be As(...)
     auto const& asArg = args[1];
     auto const* asExpr = get_if<ComplexExpression>(&asArg);
-    if(!asExpr || asExpr->getHead() != "As"_) return targets;
+    if(!asExpr || asExpr->getHead() != "As"_) return plan;
 
-    // recursively call extractSelectKeys on the inner Select to get the row keys
-    // this reuses the Format 1 / Format 2 logic already written below
-    auto innerTargets = extractSelectKeys(*innerSelect);
-    if(innerTargets.empty()) return targets;
+    plan = extractSelectPlan(*innerSelect);
+    if(plan.scope == SelectScope::Unknown) return plan;
 
-    // extract column names from As(...)
-    // As contains pairs: (outputName, inputExpression)
-    // for a simple passthrough As(price_, price_) both are the same Symbol
-    // we want the input name (even-indexed args: 0, 2, 4...)
-    // actually As stores them as alternating pairs so arg 0 = output, arg 1 = input
-    // e.g. As(FirstName_, FirstName_, LastName_, LastName_)
-    // we take every other argument starting at index 1 — the input expressions
-    std::vector<std::string> columns;
     auto const& asArgs = asExpr->getArguments();
+    if(asArgs.empty() || asArgs.size() % 2 != 0) {
+      plan.columnSelectionSafe = false;
+      return plan;
+    }
     for(size_t i = 1; i < asArgs.size(); i += 2) {
       auto const& colArg = asArgs[i];
       if(auto const* colSym = get_if<Symbol>(&colArg)) {
-        columns.push_back(colSym->getName());
+        appendRequiredColumn(plan, colSym->getName());
+      } else {
+        plan.columnSelectionSafe = false;
+        return plan;
       }
     }
-
-    // combine each row key with the column list
-    for(auto& t : innerTargets) {
-      targets.push_back({t.key, columns});
-    }
-    return targets;
+    return plan;
   }
 
-  // ── Format 1: Select(Customer, Where(Equal(id, 5))) ──────────────────────
-  //
-  // arg 0 is a plain Symbol — the table name
-  // arg 1 is Where(...) containing the condition
+  if(expr.getHead() != "Select"_) return plan;
   auto const& args = expr.getArguments();
-  if(args.size() < 1) return targets;
+  if(args.empty()) return plan;
   auto const& arg0 = args[0];
+
+  // Raw application form: Select(Customer, Where(...)). Once the table is
+  // known, every non-point predicate is a table scan rather than an unknown
+  // query, even when that table currently has no pending WAL buckets.
   if(auto const* tableSymbol = get_if<boss::Symbol>(&arg0)) {
     std::string tableName = tableSymbol->getName();
     auto tableIt = tableNameIntern.find(tableName);
-    if(tableIt == tableNameIntern.end()) return targets; // table not in WAL
+    if(tableIt != tableNameIntern.end()) plan.tableId = tableIt->second;
+    plan.scope = SelectScope::WholeTable;
 
-    if(args.size() < 2) return targets;
+    if(args.size() < 2) return plan;
     auto const& arg1 = args[1];
     auto const* whereExpr = get_if<ComplexExpression>(&arg1);
-    if(!whereExpr || whereExpr->getHead() != "Where"_) return targets;
+    if(!whereExpr || whereExpr->getHead() != "Where"_) return plan;
 
     auto const& whereArgs = whereExpr->getArguments();
-    if(whereArgs.size() < 1) return targets;
+    if(whereArgs.empty()) return plan;
     auto const& condArg = whereArgs[0];
     auto const* condExpr = get_if<ComplexExpression>(&condArg);
-    if(!condExpr || condExpr->getHead() != "Equal"_) return targets;
+    if(!condExpr) return plan;
+    std::vector<std::string> predicateColumns;
+    if(collectSupportedPredicateColumns(*condExpr, predicateColumns)) {
+      plan.columnSelectionSafe = true;
+      for(auto const& column : predicateColumns) {
+        appendRequiredColumn(plan, column);
+      }
+    }
+    if(condExpr->getHead() != "Equal"_) return plan;
 
     auto const& condArgs = condExpr->getArguments();
-    if(condArgs.size() < 2) return targets;
+    if(condArgs.size() != 2) return plan;
     auto const& colArg = condArgs[0];
     auto const& valArg = condArgs[1];
 
     auto const* colSymbol = get_if<boss::Symbol>(&colArg);
-    if(!colSymbol || colSymbol->getName() != "id") return targets;
+    if(!colSymbol || colSymbol->getName() != "id") return plan;
 
-    int32_t tableId = tableIt->second;
+    plan.scope = SelectScope::PointRows;
     if(auto const* id32 = get_if<int32_t>(&valArg)) {
-      targets.push_back({{tableId, static_cast<int64_t>(*id32)}, {}});
-      return targets;
+      if(plan.tableId.has_value()) {
+        plan.keys.push_back({*plan.tableId, static_cast<int64_t>(*id32)});
+      }
+      return plan;
     }
     if(auto const* id64 = get_if<int64_t>(&valArg)) {
-      targets.push_back({{tableId, *id64}, {}});
-      return targets;
+      if(plan.tableId.has_value()) plan.keys.push_back({*plan.tableId, *id64});
+      return plan;
     }
-    return targets;
+    // Equal(id, non-numeric) is not a valid point lookup for the current row
+    // key model. Keep it table-scoped so correctness does not depend on a
+    // failed key conversion.
+    plan.scope = SelectScope::WholeTable;
+    return plan;
   }
 
-  // ── Format 2: Select(Table(Customer, id(List(5, 6))), Where(...)) ─────────
-  //
-  // arg 0 is a ComplexExpression with head Table
+  // Pre-resolved form: Select(Table(Customer, id(List(5, 6))), Where(...)).
   auto const* tableExpr = get_if<ComplexExpression>(&arg0);
-  if(!tableExpr) return targets;
+  if(!tableExpr || tableExpr->getHead() != "Table"_) return plan;
 
   auto const& tableArgs = tableExpr->getArguments();
-  if(tableArgs.size() < 1) return targets;
+  if(tableArgs.empty()) return plan;
   auto const& nameArg = tableArgs[0];
   auto const* nameSymbol = get_if<boss::Symbol>(&nameArg);
-  if(!nameSymbol) return targets;
+  if(!nameSymbol) return plan;
   std::string tableName = nameSymbol->getName();
   auto tableIt2 = tableNameIntern.find(tableName);
-  if(tableIt2 == tableNameIntern.end()) return targets; // table not in WAL
-  int32_t tableId2 = tableIt2->second;
+  if(tableIt2 != tableNameIntern.end()) plan.tableId = tableIt2->second;
+  plan.scope = SelectScope::WholeTable;
 
   for(size_t i = 1; i < tableArgs.size(); i++) {
     auto const& colArg = tableArgs[i];
     auto const* colExpr = get_if<ComplexExpression>(&colArg);
-    if(!colExpr) continue;
+    if(!colExpr || colExpr->getHead() != "id"_) continue;
 
     auto const& colArgs = colExpr->getArguments();
-    if(colArgs.size() < 1) continue;
+    if(colArgs.empty()) continue;
     auto const& listArg = colArgs[0];
     auto const* listExpr = get_if<ComplexExpression>(&listArg);
     if(!listExpr) continue;
 
+    plan.scope = SelectScope::PointRows;
     visitRowIDs(*listExpr, [&](auto idValue) {
-      targets.push_back({{tableId2, static_cast<int64_t>(idValue)}, {}});
+      if(plan.tableId.has_value()) {
+        plan.keys.push_back({*plan.tableId, static_cast<int64_t>(idValue)});
+      }
     });
-
-    if(!targets.empty()) break;
+    break;
   }
 
-  return targets;
+  return plan;
+}
+
+static bool bucketContainsReadColumns(
+  RowBucket const& bucket,
+  std::vector<std::string> const& columns) {
+  if(bucket.insertEntry.has_value() || bucket.deleteEntry.has_value()) {
+    return true;
+  }
+  for(auto const& column : columns) {
+    auto nameIt = columnNameIntern.find(column);
+    if(nameIt != columnNameIntern.end() &&
+       bucket.columnEntries.find(nameIt->second) != nullptr) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void appendPlannedMaterialisation(
+  SelectPlan const& plan,
+  bool allowColumnSelection,
+  boss::ExpressionArguments& output,
+  FlushReason reason = FlushReason::ReadTriggered,
+  bool recordReadStats = true) {
+  size_t pendingBucketsAtPlan = 0;
+  if(plan.scope == SelectScope::WholeTable && plan.tableId.has_value()) {
+    int32_t tableId = *plan.tableId;
+    if(tableId >= 0 &&
+       tableBucketRows.size() > static_cast<size_t>(tableId)) {
+      pendingBucketsAtPlan =
+        tableBucketRows[static_cast<size_t>(tableId)].size();
+    }
+  } else if(plan.scope == SelectScope::Unknown) {
+    pendingBucketsAtPlan = walIndex.size();
+  }
+
+  auto finishRequest = [&](size_t pendingBuckets) {
+    if(recordReadStats) recordReadRequest(plan, pendingBuckets);
+  };
+
+  if(walIndex.empty()) {
+    finishRequest(pendingBucketsAtPlan);
+    return;
+  }
+
+  size_t bucketsFoundForRequest = 0;
+  auto appendBucket = [&](WALKey const& key,
+                          std::vector<std::string> const& columns) {
+    ReadBucketObservation observation;
+    auto flushed = flushBucket(key, columns, reason, &observation);
+    if(!observation.found) return;
+    bucketsFoundForRequest++;
+    if(recordReadStats) {
+      recordReadBucketMaterialised(
+        plan.scope, key.first, observation, flushed.size());
+    }
+    for(auto& expression : flushed) output.push_back(std::move(expression));
+  };
+
+  if(plan.scope == SelectScope::PointRows) {
+    for(auto const& key : plan.keys) {
+      if(allowColumnSelection) {
+        appendBucket(key, plan.columns);
+      } else {
+        appendBucket(key, {});
+      }
+    }
+    finishRequest(bucketsFoundForRequest);
+    return;
+  }
+
+  if(plan.scope == SelectScope::WholeTable && !plan.tableId.has_value()) {
+    finishRequest(pendingBucketsAtPlan);
+    return;
+  }
+
+  if(plan.scope == SelectScope::WholeTable) {
+    int32_t tableId = *plan.tableId;
+    if(tableId < 0 ||
+       tableBucketRows.size() <= static_cast<size_t>(tableId)) {
+      finishRequest(pendingBucketsAtPlan);
+      return;
+    }
+
+    auto& tableRows = tableBucketRows[static_cast<size_t>(tableId)];
+    bool const selectiveColumns =
+      allowColumnSelection && plan.columnSelectionSafe && !plan.columns.empty();
+    if(selectiveColumns) {
+      // Selective flush can leave a bucket registered, while lifecycle work
+      // can remove it. Iterate over a stable row-id snapshot so either outcome
+      // is safe and skip buckets that cannot affect the projected read.
+      auto const rowIds = tableRows;
+      for(auto rowId : rowIds) {
+        WALKey key{tableId, rowId};
+        auto bucketIt = walIndex.find(key);
+        if(bucketIt == walIndex.end() ||
+           !bucketContainsReadColumns(bucketIt->second, plan.columns)) {
+          continue;
+        }
+        appendBucket(key, plan.columns);
+      }
+      finishRequest(bucketsFoundForRequest);
+      return;
+    }
+
+    while(!tableRows.empty()) {
+      WALKey key{tableId, tableRows.back()};
+      size_t rowsBefore = tableRows.size();
+      appendBucket(key, {});
+      if(tableRows.size() >= rowsBefore) {
+        throw std::logic_error(
+          "whole-table WAL flush did not remove its indexed bucket");
+      }
+    }
+    finishRequest(pendingBucketsAtPlan);
+    return;
+  }
+
+  std::vector<WALKey> keys;
+  keys.reserve(walIndex.size());
+  for(auto const& [key, _] : walIndex) keys.push_back(key);
+
+  // Table scans flush complete rows: projected columns alone are insufficient
+  // when pending predicate columns can change membership in the result set.
+  for(auto const& key : keys) appendBucket(key, {});
+  finishRequest(pendingBucketsAtPlan);
 }
 
 static Expression flushAllBuckets(FlushReason reason = FlushReason::Manual) {
@@ -3741,12 +4848,41 @@ static Expression flushAllBuckets(FlushReason reason = FlushReason::Manual) {
   std::vector<WALKey> keys;
   keys.reserve(walIndex.size());
   for(auto const& [k, _] : walIndex) keys.push_back(k);
+
   for(auto const& key : keys) {
     auto flushed = flushBucket(key, {}, reason);
     for(auto& e : flushed) entries.push_back(std::move(e));
   }
   // commented out for better testing output
   // std::cout << "WAL: emitting " << entries.size() << " entries" << std::endl;
+  return ComplexExpression("ApplyWAL"_, {}, std::move(entries), {});
+}
+
+static Expression drainPendingInsertBuckets() {
+  size_t rowsBefore = pendingInsertRows;
+  boss::ExpressionArguments entries;
+
+  while(pendingInsertRows > 0 && !pendingInsertQueue.empty()) {
+    PendingInsertHandle handle = std::move(pendingInsertQueue.front());
+    pendingInsertQueue.pop_front();
+
+    auto bucketIt = walIndex.find(handle.key);
+    if(bucketIt == walIndex.end()) {
+      continue;
+    }
+
+    auto const& pendingInsert = bucketIt->second.insertEntry;
+    if(!pendingInsert.has_value() || pendingInsert->seq != handle.insertSeq) {
+      continue;
+    }
+
+    auto flushed = flushBucket(handle.key, {}, FlushReason::InsertThreshold);
+    for(auto& expression : flushed) {
+      entries.push_back(std::move(expression));
+    }
+  }
+
+  recordInsertDrain(rowsBefore - pendingInsertRows);
   return ComplexExpression("ApplyWAL"_, {}, std::move(entries), {});
 }
 
@@ -3787,7 +4923,7 @@ static bool captureMultiRowUpdateOperation(
 
   for(auto const& rowId : operation.rowIds) {
     WALKey key{tableId, toInt64(rowId)};
-    auto [bucketIt, inserted] = walIndex.try_emplace(key);
+    auto [bucketIt, inserted] = tryEmplaceBucket(key);
     RowBucket& bucket = bucketIt->second;
     if(inserted) {
       bucket.tableId = key.first;
@@ -3800,11 +4936,9 @@ static bool captureMultiRowUpdateOperation(
         ++assignmentIndex) {
       int seq = assignmentSeqs[assignmentIndex];
       int32_t colId = operation.assignments[assignmentIndex].colId;
-      auto [colPtr, colInserted] = bucket.columnEntries.try_emplace(colId);
+      auto* colPtr = bucket.columnEntries.try_emplace(colId).first;
       if(!colPtr) continue;
-      if(colInserted) {
-        colPtr->entries.reserve(WAL_COLUMN_ENTRY_RESERVE);
-      }
+      reserveHotColumnIfNeeded(colPtr->entries);
       colPtr->entries.push_back(WALEntryRef{opId, assignmentIndex, seq});
       registerReverseDependencies(
         bucket,
@@ -3834,6 +4968,23 @@ static Expression evaluate(Expression &&e) {
       if constexpr(std::is_same_v<std::decay_t<decltype(expr)>, ComplexExpression>) {
         auto head = expr.getHead();
         auto const& args = expr.getArguments();
+
+        // InsertInto - capture complete row creation/replacement in the same
+        // row bucket used by later updates and deletes.
+        if(head == "InsertInto"_) {
+          if(!captureInsert(expr)) {
+            return std::move(expr);
+          }
+
+          if(walTotalEntries >= WAL_THRESHOLD) {
+            return flushAllBuckets(FlushReason::GlobalThreshold);
+          }
+          if(WAL_INSERT_DRAIN_THRESHOLD > 0 &&
+             pendingInsertRows >= WAL_INSERT_DRAIN_THRESHOLD) {
+            return drainPendingInsertBuckets();
+          }
+          return "Insert_Logged"_();
+        }
 
         // Update - defer to WAL
         if (head == "Update"_) {
@@ -3890,7 +5041,7 @@ static Expression evaluate(Expression &&e) {
             }
 
             if(walTotalEntries >= WAL_THRESHOLD && prefixFlushes.empty()) {
-              return flushAllBuckets(FlushReason::ChainThreshold);
+              return flushAllBuckets(FlushReason::GlobalThreshold);
             }
 
             if(!prefixFlushes.empty()) {
@@ -3919,7 +5070,7 @@ static Expression evaluate(Expression &&e) {
 
           // check if WAL has hit the threshold - if so flush to Arrow storage
           if(walTotalEntries >= WAL_THRESHOLD) {
-            return flushAllBuckets(FlushReason::ChainThreshold);
+            return flushAllBuckets(FlushReason::GlobalThreshold);
           }
 
           return "Update_Logged"_();
@@ -3980,7 +5131,7 @@ static Expression evaluate(Expression &&e) {
 
           // check if WAL has hit the threshold - if so flush to Arrow storage
           if(walTotalEntries >= WAL_THRESHOLD) {
-            return flushAllBuckets(FlushReason::ChainThreshold);
+            return flushAllBuckets(FlushReason::GlobalThreshold);
           }
           return "Delete_Logged"_();
         }
@@ -3993,6 +5144,12 @@ static Expression evaluate(Expression &&e) {
 
             // collect all entries across columns with their seq numbers
             std::vector<std::pair<int, Expression>> allEntries;
+            if(bucket.insertEntry.has_value()) {
+              allEntries.push_back({
+                bucket.insertEntry->seq,
+                buildInsertDebugSummary(bucket, *bucket.insertEntry)
+              });
+            }
             for(auto const& col : bucket.columnEntries) {
               for(auto const& e : col.entries) {
                 if(auto const* local = std::get_if<WALEntry>(&e)) {
@@ -4078,12 +5235,16 @@ static Expression evaluate(Expression &&e) {
         // ClearWAL - empty the log
         if (head == "ClearWAL"_) {
           walIndex.clear();
+          tableBucketRows.clear();
           walOperations.clear();
           reverseDepsByCell.clear();
           nextOperationId = 0;
+          nextGeneratedLocalId = 0;
           globalNextSeq = 0;
           pendingCrossRowRefEntries = 0;
           walTotalEntries = 0;
+          pendingInsertQueue.clear();
+          pendingInsertRows = 0;
           tableNameIntern.clear();
           tableIdToSymbol.clear();
           columnNameIntern.clear();
@@ -4104,6 +5265,7 @@ static Expression evaluate(Expression &&e) {
             // count entries before optimise
             size_t countBefore = 0;
             for(auto const& col : bucket.columnEntries) countBefore += col.entries.size();
+            if(bucket.insertEntry.has_value()) countBefore++;
             if(bucket.deleteEntry.has_value()) countBefore++;
 
             optimiseBucketImpl(bucket);
@@ -4111,6 +5273,7 @@ static Expression evaluate(Expression &&e) {
             // count entries after optimise
             size_t countAfter = 0;
             for(auto const& col : bucket.columnEntries) countAfter += col.entries.size();
+            if(bucket.insertEntry.has_value()) countAfter++;
             if(bucket.deleteEntry.has_value()) countAfter++;
 
             walTotalEntries -= countBefore;
@@ -4121,30 +5284,57 @@ static Expression evaluate(Expression &&e) {
           return "WAL_Optimised"_();
         }
 
+        // A physical index must be built after all pending rows for its table
+        // have been materialised. Unrelated tables remain lazy.
+        if(head == "CreateIndex"_ && args.size() == 3) {
+          auto const& indexNameArg = args[0];
+          auto const& tableArg = args[1];
+          auto const& byArg = args[2];
+          auto const* indexName = get_if<std::string>(&indexNameArg);
+          auto const* tableSymbol = get_if<Symbol>(&tableArg);
+          auto const* by = get_if<ComplexExpression>(&byArg);
+          bool validColumns = by && by->getHead() == "By"_ &&
+                              !by->getArguments().empty();
+          if(validColumns) {
+            for(auto const& columnArg : by->getArguments()) {
+              if(!get_if<Symbol>(&columnArg)) {
+                validColumns = false;
+                break;
+              }
+            }
+          }
+
+          if(indexName && tableSymbol && validColumns) {
+            SelectPlan plan;
+            plan.scope = SelectScope::WholeTable;
+            auto tableIt = tableNameIntern.find(tableSymbol->getName());
+            if(tableIt != tableNameIntern.end()) plan.tableId = tableIt->second;
+
+            boss::ExpressionArguments applyArgs;
+            appendPlannedMaterialisation(
+              plan, false, applyArgs, FlushReason::Other, false);
+            applyArgs.push_back(std::move(expr));
+            return ComplexExpression("ApplyWAL"_, {}, std::move(applyArgs), {});
+          }
+        }
+
+        // Top(Project(Select(...)), By(...), 1) materialises the inner read
+        // scope before the downstream engine performs its fused top-one path.
+        if(head == "Top"_) {
+          auto plan = extractSelectPlan(expr);
+          boss::ExpressionArguments applyArgs;
+          appendPlannedMaterialisation(plan, true, applyArgs);
+          applyArgs.push_back(std::move(expr));
+          return ComplexExpression("ApplyWAL"_, {}, std::move(applyArgs), {});
+        }
+
         // Project(Select(...), As(...)) - column-selective flush before read
         // handles the case where only specific columns are being read
         // we flush only those columns for the affected row, leaving others buffered
         if(head == "Project"_) {
-          auto targets = extractSelectKeys(expr);
+          auto plan = extractSelectPlan(expr);
           boss::ExpressionArguments applyArgs;
-
-          if(!targets.empty()) {
-            // selective flush — only requested columns for affected rows
-            for(auto const& target : targets) {
-              auto flushed = flushBucket(target.key, target.columns, FlushReason::ReadTriggered);
-              for(auto& e : flushed) applyArgs.push_back(std::move(e));
-            }
-          } else {
-            // could not parse — fall back to full flush for correctness
-            // std::cout << "WAL: Project fallback to full flush" << std::endl;
-            std::vector<WALKey> keysCopy;
-            keysCopy.reserve(walIndex.size());
-            for(auto const& [k, _] : walIndex) keysCopy.push_back(k);
-            for(auto const& key : keysCopy) {
-              auto flushed = flushBucket(key, {}, FlushReason::ReadTriggered);
-              for(auto& e : flushed) applyArgs.push_back(std::move(e));
-            }
-          }
+          appendPlannedMaterialisation(plan, true, applyArgs);
 
           // append the original Project expression as the last argument
           // the downstream engine will evaluate the Project normally after WAL is applied
@@ -4155,27 +5345,9 @@ static Expression evaluate(Expression &&e) {
         // Select - triggers WAL flush before read
         // bare Select flushes the whole row — no column filter
         if(head == "Select"_) {
-          auto targets = extractSelectKeys(expr);
+          auto plan = extractSelectPlan(expr);
           boss::ExpressionArguments applyArgs;
-
-          if(!targets.empty()) {
-            // selective flush — only affected rows, but all columns
-            for(auto const& target : targets) {
-              auto flushed = flushBucket(target.key, {}, FlushReason::ReadTriggered); // no column filter — whole row
-              for(auto& e : flushed) applyArgs.push_back(std::move(e));
-            }
-          } else {
-            // could not parse row IDs — fall back to full flush for correctness
-            // commented out for better testing output
-            // std::cout << "WAL: Select fallback to full flush" << std::endl;
-            std::vector<WALKey> keysCopy;
-            keysCopy.reserve(walIndex.size());
-            for(auto const& [k, _] : walIndex) keysCopy.push_back(k);
-            for(auto const& key : keysCopy) {
-              auto flushed = flushBucket(key, {}, FlushReason::ReadTriggered);
-              for(auto& e : flushed) applyArgs.push_back(std::move(e));
-            }
-          }
+          appendPlannedMaterialisation(plan, false, applyArgs);
 
           // append the original Select as the last argument
           applyArgs.push_back(std::move(expr));
@@ -4183,7 +5355,25 @@ static Expression evaluate(Expression &&e) {
         }
         
         
-        // for flushing the WAL
+        // FlushWALChain(tableName, rowId) -- benchmark chain-bound materialisation.
+        if(head == "FlushWALChain"_ && args.size() == 2) {
+          auto const& tableArg = args[0];
+          auto const* tableSymbol = get_if<Symbol>(&tableArg);
+          if(!tableSymbol) return flushAllBuckets(FlushReason::ChainThreshold);
+
+          auto const& rowArg = args[1];
+          int64_t rowId = 0;
+          if(auto const* id32 = get_if<int32_t>(&rowArg)) rowId = *id32;
+          else if(auto const* id64 = get_if<int64_t>(&rowArg)) rowId = *id64;
+          else return flushAllBuckets(FlushReason::ChainThreshold);
+
+          WALKey key{internTableName(tableSymbol->getName()), rowId};
+          auto flushed = flushBucket(key, {}, FlushReason::ChainThreshold);
+          boss::ExpressionArguments entries;
+          for(auto& entry : flushed) entries.push_back(std::move(entry));
+          return ComplexExpression("ApplyWAL"_, {}, std::move(entries), {});
+        }
+
         // for flushing the WAL
         if(head == "FlushWAL"_) {
           // FlushWAL() — flush everything
@@ -4217,6 +5407,23 @@ static Expression evaluate(Expression &&e) {
         if(head == "SetWALThreshold"_) {
           WAL_THRESHOLD = get<int32_t>(expr.getArguments()[0]);
           return "WALThreshold_Set"_();
+        }
+
+        if(head == "SetWALInsertDrainThreshold"_ && args.size() == 1) {
+          int64_t requestedThreshold = 0;
+          auto const& thresholdArg = args[0];
+          if(auto const* threshold32 = get_if<int32_t>(&thresholdArg)) {
+            requestedThreshold = *threshold32;
+          } else if(auto const* threshold64 = get_if<int64_t>(&thresholdArg)) {
+            requestedThreshold = *threshold64;
+          } else {
+            return "WALInsertDrainThreshold_Invalid"_();
+          }
+
+          WAL_INSERT_DRAIN_THRESHOLD = requestedThreshold > 0
+            ? static_cast<size_t>(requestedThreshold)
+            : 0;
+          return "WALInsertDrainThreshold_Set"_();
         }
       }
       return std::move(expr);
