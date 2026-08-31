@@ -2669,7 +2669,7 @@ static ColumnFoldResult resolveColumnEntries(
 
 static ColumnFoldResult resolveColumnEntries(
   std::vector<WALColumnEntry>& columnEntries,
-  RowBucket const& bucket,
+  RowBucket& bucket,
   int cutoffSeq,
   int32_t colId,
   std::function<void(int32_t, WALEntry const&)> const* beforeApplyEntry = nullptr)
@@ -2678,11 +2678,16 @@ static ColumnFoldResult resolveColumnEntries(
   entries.reserve(columnEntries.size());
   for(auto& entry : columnEntries) {
     if(auto* local = std::get_if<WALEntry>(&entry)) {
+      unregisterBucketDependencySummary(
+        bucket, colId, local->referencedCols, local->referencedCells);
+      unregisterReverseDependencies(bucket, colId, local->seq, local->referencedCols);
+      unregisterCellReverseDependencies(bucket, colId, local->seq, local->referencedCells);
       entries.push_back(std::move(*local));
     } else if(auto const* ref = std::get_if<WALEntryRef>(&entry)) {
       entries.push_back(consumeColumnEntryRef(*ref));
     }
   }
+  columnEntries.clear();
 
   return resolveColumnEntries(std::move(entries), bucket, cutoffSeq, colId, beforeApplyEntry);
 }
