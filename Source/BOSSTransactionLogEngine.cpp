@@ -22,7 +22,6 @@
 using std::string_literals::operator""s;
 using boss::utilities::operator""_;
 using boss::ComplexExpression;
-using boss::Span;
 using boss::Symbol;
 
 using boss::Expression;
@@ -34,27 +33,23 @@ using boss::expressions::generic::get_if;
 // WAL Index Structure
 // ============================================================
 //
-// The WAL is indexed by (tableName, rowID).
-// Each row gets its own RowBucket.
+// The WAL is indexed by interned (table ID, row ID) keys.
+// Each pending row has a RowBucket containing lifecycle entries, column writes,
+// and dependency metadata.
 //
 // RowBucket uses per-column entry lists with sequence numbers:
-//   - columnEntries: maps each column name to its own vector of WALEntry
-//   - deleteEntry:   stores the latest Delete for this row (if any)
-//   - nextSeq:       monotonically increasing counter for global arrival order
+//   - columnEntries stores local writes or references to shared multi-row writes
+//   - insertEntry and deleteEntry define row lifecycle boundaries
+//   - globalNextSeq provides a total arrival order across all buckets
 //
-// A WALEntry holds the raw expression and a sequence number.
-// The sequence number encodes the global arrival order across ALL columns
-// in the bucket — so comparing seq values tells you which write came first
-// regardless of which column was written.
+// Sequence numbers preserve write order across columns and rows. This order is
+// required when resolving dependencies and emitting physical updates.
 //
 // This design enables:
-//   1. Same-column dependency folding — unchanged from before
-//   2. Cross-column dependency resolution — when resolving column X at seq=s,
+//   1. Same-column dependency folding
+//   2. Cross-column dependency resolution: when resolving column X at seq=s,
 //      find the latest entry for dependency column Y with seq < s
-//   3. Selective column flush — each column's vector is independent
-//
-// Capture:  O(c) per write
-// Flush:    O(k_col) per column, O(k_col_dep) for each cross-column dependency
+//   3. Selective column flushing while unrelated columns remain buffered
  
 using RowID = std::variant<int32_t, int64_t>;
  
@@ -73,13 +68,13 @@ struct WALKeyHash {
   }
 };
 
-// Intern tables — convert low-cardinality string keys (table names, column names)
+// Intern tables convert low-cardinality string keys (table names and column names)
 // to small integers so WAL index and column entry map lookups hash integers, not strings.
 static std::unordered_map<std::string, int32_t> tableNameIntern;
 static std::unordered_map<std::string, int32_t> columnNameIntern;
 // Reverse lookup: tableId -> Symbol (populated alongside tableNameIntern)
 static std::vector<Symbol> tableIdToSymbol;
-// Reverse lookup: colId → Symbol (populated alongside columnNameIntern)
+// Reverse lookup: colId -> Symbol (populated alongside columnNameIntern)
 static std::vector<Symbol> columnIdToSymbol;
 static int32_t nextTableId = 0;
 static int32_t nextColumnId = 0;
@@ -235,9 +230,8 @@ struct SelectPlan {
 };
 
  
-// Fix 3: Inline small array replacing unordered_map<int32_t, vector<WALEntry>>.
-// Most OLTP rows touch ≤8 columns; storing them inline avoids two heap pointer
-// hops per lookup and keeps the column map entirely on the stack / in-object.
+// Most OLTP rows touch at most eight columns. Storing them inline avoids two
+// heap pointer hops per lookup and keeps the column map in the row bucket.
 struct ColEntry {
   int32_t colId = -1;
   std::vector<WALColumnEntry> entries;
@@ -260,7 +254,7 @@ struct InlineColVec {
   }
 
   // Returns existing entry or inserts a new slot.
-  // Returns {nullptr, false} if the array is full (should not happen for ≤N columns).
+  // Returns {nullptr, false} if the array is full.
   std::pair<ColEntry*, bool> try_emplace(int32_t id) {
     if(auto* p = find(id)) return {p, false};
     if(size < N) {
@@ -297,7 +291,7 @@ struct InlineColVec {
 };
 
 struct RowBucket {
-  // per-column entry lists — inline fixed-size array (Fix 3)
+  // Per-column entry lists stored in an inline fixed-size array.
   InlineColVec columnEntries;
 
   // Pending physical row creation/replacement. This is deliberately not
@@ -366,8 +360,8 @@ static int latestColumnResetSeq(
   return resetSeq;
 }
 
-// the WAL index: (tableName, rowID) → bucket
-// Fix 2: ankerl::unordered_dense stores entries in a flat contiguous array,
+// The WAL index maps (table ID, row ID) to a bucket.
+// ankerl::unordered_dense stores entries in a flat contiguous array,
 // eliminating one heap pointer hop per lookup compared to std::unordered_map.
 static ankerl::unordered_dense::map<WALKey, RowBucket, WALKeyHash> walIndex;
 static std::vector<std::vector<int64_t>> tableBucketRows;
@@ -429,7 +423,7 @@ static void eraseBucket(WALIndexIterator bucketIt) {
   walIndex.erase(bucketIt);
 }
 
-// total number of entries across all buckets — for threshold check
+// Total number of entries across all buckets, used for threshold checks.
 static size_t walTotalEntries = 0;
 
 // Inserts use unique row IDs in workloads such as TPC-C, so a per-row update
@@ -892,77 +886,6 @@ static void printWALStats(std::string const& = "") {
 
 #endif
 
-// WAL - just a list of expression for now
-// static std:: vector<Expression> writeAheadLog;
-
-
-// Helper: extract table name from a WAL entry
-// static std::string getTableName(ComplexExpression const& entry) {
-//   if(entry.getArguments().size() == 0) return "";
-//   auto arg = entry.getArguments()[0];
-//   auto const* table = get_if<Symbol>(&arg);
-//   return table ? table->getName() : "";
-// }
-
-// Helper: extract row IDs from a WAL entry (second argument is "id"_(List(...)))
-// static std::vector<RowID> getRowIDs(ComplexExpression const& entry) {
-//   std::vector<RowID> ids;
-//   if(entry.getArguments().size() < 2) return ids;
-  
-//   // arg 1 is id(List(...))
-//   auto idArg = entry.getArguments()[1];
-//   auto const* idExpr = get_if<ComplexExpression>(&idArg);
-//   if(!idExpr) return ids;
-
-//   // inside id(...) is List(...)
-//   auto listArg = idExpr->getArguments()[0];
-//   auto const* listExpr = get_if<ComplexExpression>(&listArg);
-//   if(!listExpr) return ids;
-
-//   // Case 1: plain integers in dynamic arguments
-//   for(size_t i = 0; i < listExpr->getArguments().size(); i++) {
-//     auto val = listExpr->getArguments()[i];
-//     if(auto const* id32 = get_if<int32_t>(&val)) {
-//       ids.push_back(*id32);
-//     } else if(auto const* id64 = get_if<int64_t>(&val)) {
-//       ids.push_back(*id64);
-//     }
-//   }
-
-//   // Case 2: Spans in span arguments
-//   // expression arrives from Velox - type unknown at compile time
-//   for (auto const& spanArg : listExpr->getSpanArguments()) {
-//     std::visit([&ids](auto const& typedSpan) {
-//       using T = std::decay_t<decltype(*typedSpan.begin())>;
-//       if constexpr(std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
-//         for(auto it = typedSpan.begin(); it != typedSpan.end(); ++it) {
-//           ids.push_back(*it);
-//         }
-//       }
-//       // non-numeric types (float, string etc) are silently skipped
-//       // because row IDs will always be integers
-//     }, spanArg);
-//   }
-//   return ids;
-// }
-
-// Initial design decision is for the prototype
-// we only allow one row, or one ID per expression
-// to prevent optimisation complexity
-// need to fix the code below
-// static bool sameTableAndRow(ComplexExpression const& a, ComplexExpression const& b) {
-//   if(getTableName(a) != getTableName(b)) return false;
-//   auto idsA = getRowIDs(a);
-//   auto idsB = getRowIDs(b);
-//   if(idsA.empty() || idsB.empty()) return false;
-
-//   // cast both to int64_t as this does not change the value
-//   auto toInt64 = [](RowID const& id) {
-//     return std::visit([](auto const& v) { return static_cast<int64_t>(v); }, id); 
-//   };
-//   return toInt64(idsA[0]) == toInt64(idsB[0]);
-// }
-
 // Helper: iterate over all row IDs in a List expression
 // handles both plain integers (our WAL format) and Spans (from Velox)
 // calls callback(idValue) for each ID found, preserving original type
@@ -1070,10 +993,10 @@ static decltype(auto) visitArgumentByReference(WrappedArgument const& wrappedArg
 
 // Attempt constant folding on a folded expression.
 // handles same-operator chains where both constants are concrete numbers
-// e.g. Plus(Plus(price, 1.0), 1.0)   → Plus(price, 2.0)
-// e.g. Times(Times(price, 2.0), 3.0) → Times(price, 6.0)
-// e.g. Minus(Minus(price, 1.0), 2.0) → Minus(price, 3.0)
-// e.g. Divide(Divide(price, 2.0), 2.0) → Divide(price, 4.0)
+// e.g. Plus(Plus(price, 1.0), 1.0) becomes Plus(price, 2.0)
+// e.g. Times(Times(price, 2.0), 3.0) becomes Times(price, 6.0)
+// e.g. Minus(Minus(price, 1.0), 2.0) becomes Minus(price, 3.0)
+// e.g. Divide(Divide(price, 2.0), 2.0) becomes Divide(price, 4.0)
 // If the pattern does not match, the original expression is returned unchanged.
 static Expression simplifyConstantFold(Expression expr) {
   auto const* outer = get_if<ComplexExpression>(&expr);
@@ -1088,8 +1011,8 @@ static Expression simplifyConstantFold(Expression expr) {
   if(outerHead != "Plus"_  && outerHead != "Minus"_ &&
      outerHead != "Times"_ && outerHead != "Divide"_) return expr;
 
-  // outer's first arg must be a ComplexExpression with the SAME operator.
-  // V2E-A: inspect by wrapper/reference instead of materialising argument 0.
+  // The outer expression's first argument must use the same operator.
+  // Inspect it by reference to avoid materialising a temporary expression.
   auto const* inner = std::visit(
     [](auto const& unwrapped) -> ComplexExpression const* {
       return asComplexExpressionPtr(unwrapped);
@@ -1103,8 +1026,7 @@ static Expression simplifyConstantFold(Expression expr) {
   auto const& innerArgs = inner->getArguments();
   if(innerArgs.size() < 2) return expr;
 
-  // inner's second arg must be a concrete number (c1).
-  // V2E-A: inspect by wrapper/reference instead of materialising argument 1.
+  // The inner expression's second argument must be a concrete number.
   auto c1 = std::visit(
     [](auto const& unwrapped) -> std::optional<double> {
       return toDoubleValue(unwrapped);
@@ -1114,8 +1036,7 @@ static Expression simplifyConstantFold(Expression expr) {
 
   if(!c1) return expr;
 
-  // outer's second arg must be a concrete number (c2).
-  // V2E-A: inspect by wrapper/reference instead of materialising argument 1.
+  // The outer expression's second argument must be a concrete number.
   auto c2 = std::visit(
     [](auto const& unwrapped) -> std::optional<double> {
       return toDoubleValue(unwrapped);
@@ -2161,21 +2082,13 @@ static bool bucketHasPendingWork(RowBucket const& bucket) {
 }
 
 // ============================================================
-// substituteAndFold — recursive substitution without std::function overhead
+// substituteAndFold: recursive substitution and constant folding
 // ============================================================
 //
 // Replaces all occurrences of colName with replacement inside expr,
-// applying constant folding after rebuilding each ComplexExpression node (V2M).
-//
-// V2O: foldColumnValues previously used a std::function<Expression(Expression
-// const&)> for mutual recursion between two lambdas (substituteExpr and
-// substituteValue). std::function uses type erasure, so every recursive call
-// went through virtual dispatch, plus each argument passed to it was
-// implicitly converted into a temporary Expression (a clone for
-// ComplexExpression). Replacing it with two ordinary mutually recursive
-// functions removes both the dispatch overhead and the implicit clones —
-// visitArgumentByReference already gives us the concrete unwrapped type, so
-// substituteAndFoldValue can dispatch on it directly via if constexpr.
+// applying constant folding after rebuilding each ComplexExpression node.
+// The mutually recursive functions operate on concrete values to avoid type-erased
+// recursive calls and temporary Expression clones.
 
 static Expression substituteAndFold(Expression expr,
                                     Symbol const& colName,
@@ -2229,7 +2142,7 @@ static Expression substituteAndFoldValue(T&& value,
     Expression rebuilt = ComplexExpression(
       std::move(head), std::move(statics), std::move(newArgs), std::move(spans));
 
-    // V2M: apply constant folding immediately during recursive substitution.
+    // Apply constant folding immediately during recursive substitution.
     return simplifyConstantFold(std::move(rebuilt));
   } else if constexpr(std::is_same_v<Decayed, Expression>) {
     return substituteAndFold(std::move(value), colName, replacement, moved);
@@ -2324,13 +2237,13 @@ static Expression composeWithLet(
 }
 
 // ============================================================
-// walIndexPush — capture one raw entry into the right bucket
+// walIndexPush: capture one raw entry into the right bucket
 // ============================================================
 //
 // For Update: extract each column from Set(...), push a WALEntry
 //             into that column's vector with the current seq number
-// For Delete: store as deleteEntry — not in any column vector
-// O(c) per write — one push per column in Set(...)
+// For Delete: store as deleteEntry, not in any column vector.
+// Capture is O(c) per write, with one push per column in Set(...).
 
 template <typename T>
 static bool isSupportedInsertPrimitive(T const& value) {
@@ -2452,8 +2365,6 @@ static bool captureInsert(ComplexExpression& insertExpression) {
 
 static void walIndexPush(WALKey const& key, Expression walEntry) {
   // Create bucket if this is the first entry for this row.
-  // V2J: use try_emplace to avoid find(key) followed by walIndex[key],
-  // which performs repeated hash-table lookup work.
   auto [bucketIt, inserted] = tryEmplaceBucket(key);
 
   RowBucket& bucket = bucketIt->second;
@@ -2464,8 +2375,8 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
 
   if(auto* entry = get_if<ComplexExpression>(&walEntry)) {
     if(entry->getHead() == "Update"_ && entry->getArguments().size() >= 3) {
-      // V2Q: decompose the incoming Update expression so we can move its
-      // sub-expressions directly into WALEntries instead of cloning them.
+      // Move the Update subexpressions directly into WAL entries instead of
+      // cloning them.
       auto [updateHead, updateStatics, updateDynamics, updateSpans] =
         std::move(*entry).decompose();
 
@@ -2475,8 +2386,8 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
 
       Expression setExpression = std::move(updateDynamics[2]);
       if(auto* setExpr = get_if<ComplexExpression>(&setExpression)) {
-        // iterate columns in Set(...) in order — order matters for cross-column dependencies
-        // e.g. Set(price(100), total(Times(price, 2))) — price must come before total
+        // Iterate columns in Set(...) in order because cross-column dependencies
+        // require Set(price(100), total(Times(price, 2))) to preserve that order.
         // we assign a fresh seq to each column so they sort correctly at flush time
         auto [setHead, setStatics, setDynamics, setSpans] = std::move(*setExpr).decompose();
 
@@ -2497,7 +2408,7 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
             int seq = globalNextSeq++;
 
             auto* colPtr2 = bucket.columnEntries.try_emplace(colId).first;
-            if(!colPtr2) continue; // too many columns (>N) — should not happen for OLTP
+            if(!colPtr2) continue; // The fixed-size column collection is full.
             auto& colEntries = colPtr2->entries;
 
             reserveHotColumnIfNeeded(colEntries);
@@ -2527,7 +2438,7 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
         }
       }
     } else if(entry->getHead() == "Delete"_) {
-      // Delete gets its own seq — after all column seqs if called after an Update
+      // Delete gets its own sequence after earlier Update column sequences.
       // but Delete is captured independently so seq reflects actual arrival order
       if(bucket.idColumnId < 0 && entry->getArguments().size() >= 2) {
         auto const& deleteArgs = entry->getArguments();
@@ -2549,11 +2460,11 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
 }
 
 // ============================================================
-// resolveColumnEntries — resolve one column's entry list into a final expression
+// resolveColumnEntries: resolve one column's entries into a final expression
 // ============================================================
 //
 // Takes the column's entry list (in arrival order, seq ascending) and the
-// bucket (for cross-column dependency lookup), plus the cutoff seq — only
+// bucket (for cross-column dependency lookup), plus the cutoff seq. Only
 // entries with seq <= cutoffSeq are considered.
 //
 // Returns the resolved column assignment expression e.g. price(Plus(price, 100))
@@ -2564,7 +2475,7 @@ static void walIndexPush(WALKey const& key, Expression walEntry) {
 //   and Y != X, look up Y's entries in the bucket and resolve Y up to cutoffSeq
 //
 // The in-memory engine processes Set(...) columns sequentially and updates
-// row state as it goes — so emitting columns in seq order gives correct results
+// row state as it goes, so emitting columns in sequence order gives correct results.
 // without needing to substitute concrete values here.
 
 // Result of folding one column's entry list.
@@ -3921,19 +3832,16 @@ static std::optional<DependencyMaterialisationResult> tryMaterialiseDependencySe
 }
 
 // ============================================================
-// ResolvedCol / resolveBucketColumns — read-only column resolution
+// ResolvedCol / resolveBucketColumns: read-only column resolution
 // ============================================================
 //
 // Resolves each column's entry list into a single final expression, sorted
-// by latestSeq ascending (the order columns were last written — needed so
+// by latestSeq ascending. The order columns were last written is needed so
 // cross-column dependencies are emitted correctly: if price was written
 // before total, price must appear before total in Set(...)).
 //
-// V2P: this is the resolution half of what optimiseBucketImpl used to do,
-// pulled out so callers that are about to consume the result directly
-// (flushBucket) don't have to round-trip it through bucket.columnEntries
-// first. Does NOT mutate the bucket — see optimiseBucketImpl below for the
-// "resolve and persist back into columnEntries" version.
+// Resolution does not mutate the bucket. Callers either emit the result directly
+// or persist the columns that must remain buffered.
 struct ResolvedCol {
   int32_t colId;
   Symbol columnName;
@@ -4024,26 +3932,25 @@ static BucketResolution resolveBucketColumns(
 }
 
 // ============================================================
-// optimiseBucketImpl — compact bucket in place
+// optimiseBucketImpl: compact bucket in place
 // ============================================================
 //
 // Resolves each column's entry list into a single final expression and
 // persists that compacted state back into bucket.columnEntries. Handles:
-//   Rule 1a: blind write — last-write-wins, discard earlier entries
-//   Rule 1b: same-column dependent write — fold chain backwards
-//   Rule 1c: cross-column dependency — when column X at seq s depends on
+//   Rule 1a: blind write - last-write-wins, discard earlier entries
+//   Rule 1b: same-column dependent write - fold chain backwards
+//   Rule 1c: cross-column dependency - when column X at seq s depends on
 //            Symbol Y (different column), resolve Y's entries up to seq s-1
 //            and emit Y before X in the merged Set(...)
-//   Rule 2:  Delete — discard all entries before deleteEntry.seq
-//   Rule 3:  merge columns — all surviving columns in one Update (implicit)
+//   Rule 2: Delete - discard all entries before deleteEntry.seq
+//   Rule 3: merge columns - all surviving columns in one Update (implicit)
 //
 // After this call the bucket's columnEntries are replaced with at most
 // one entry per column (the resolved result), and deleteEntry is preserved.
 //
 // Used by the standalone OptimiseWAL command, and by flushBucket's
 // column-selective path for the columns that must survive the flush.
-// flushBucket's whole-row path does NOT call this — see resolveBucketColumns
-// above and the V2P comment in flushBucket for why.
+// flushBucket's whole-row path resolves columns for direct emission instead.
 static void optimiseBucketImpl(RowBucket& bucket) {
   auto resolution = resolveBucketColumns(bucket);
 
@@ -4052,12 +3959,12 @@ static void optimiseBucketImpl(RowBucket& bucket) {
   clearBucketDependencySummary(bucket);
   bucket.columnEntries.clear();
 
-  // V2L: rebuild compacted bucket as one structured WAL entry per column.
+  // Rebuild the compacted bucket as one structured WAL entry per column.
   // The resolved result is already the folded RHS value expression.
   // Do not rebuild price(valueExpr) here.
   for(auto& rc : resolution.columns) {
     auto [colPtr, colInserted] = bucket.columnEntries.try_emplace(rc.colId);
-    if(!colPtr) continue; // too many columns — should not happen for OLTP
+    if(!colPtr) continue; // The fixed-size column collection is full.
     auto& colEntries = colPtr->entries;
 
     if(colInserted) {
@@ -4094,19 +4001,16 @@ static void optimiseBucketImpl(RowBucket& bucket) {
   rebuildReverseDependencies(bucket);
   rebuildBucketDependencySummary(bucket);
   registerAllCellReverseDependencies(bucket);
-  // deleteEntry is preserved unchanged — caller decides what to emit
+  // deleteEntry is preserved unchanged; the caller decides what to emit.
 }
 
 // ============================================================
-// buildUpdateFromResolvedColumns — assemble Update(...) directly from
+// buildUpdateFromResolvedColumns: assemble Update(...) directly from
 // already-resolved columns, without touching bucket.columnEntries
 // ============================================================
 //
-// V2P: takes a vector of ResolvedCol (from resolveBucketColumns) instead of
-// reading bucket.columnEntries. The caller decides which resolved columns
-// to pass in — typically the ones being flushed right now, which would
-// otherwise be written into columnEntries only to be read back out once
-// here and then discarded/erased.
+// The caller passes only the resolved columns that should be emitted. Columns
+// that remain buffered are persisted separately.
 //
 // selected is already sorted by latestSeq ascending (resolveBucketColumns
 // guarantees this, and partitioning it preserves relative order), so no
@@ -4141,7 +4045,7 @@ static std::optional<Expression> buildUpdateFromResolvedColumns(
 }
 
 // ============================================================
-// flushBucket — optimise, collect, clear
+// flushBucket: optimise, collect, and clear
 // ============================================================
  
 static std::vector<Expression> flushBucket(
@@ -4279,15 +4183,8 @@ static std::vector<Expression> flushBucket(
     return result;
   }
 
-  // V2P: resolve all columns once, without writing the result back into
-  // bucket.columnEntries yet. Previously optimiseBucketImpl() wrote every
-  // resolved column into the map unconditionally, even though:
-  //   - in a whole-row flush, the entire bucket (map included) is destroyed
-  //     a few lines later — so the rewrite was read once then thrown away
-  //   - in a column-selective flush, the columns being flushed right now
-  //     are written into the map only to be read back out and erased again
-  // Only columns that need to remain in the bucket afterward are persisted
-  // below; columns being flushed now go straight from resolution to output.
+  // Resolve once without mutating the bucket. Flushed columns go directly to
+  // output, while columns that remain buffered are persisted below.
   std::optional<CellDependencyFlushContext> fullRowCellContext;
   std::function<void(int32_t, WALEntry const&)> beforeApplyEntry;
   if(flushingAllColumns && bucket.pendingCrossRowCellEntries > 0) {
@@ -4336,14 +4233,14 @@ static std::vector<Expression> flushBucket(
       }
     }
 
-    // V2P: build the final physical Update directly from the resolved
-    // columns — every column is being flushed, so none need to be written
+    // Build the physical Update directly from the resolved columns. Every
+    // column is being flushed, so none need to be written
     // into bucket.columnEntries before the bucket is erased below.
     if(auto update = buildUpdateFromResolvedColumns(bucket, resolution.columns)) {
       result.push_back(std::move(*update));
     }
 
-    // whole-row flush — the bucket (and its columnEntries array) is about to
+    // The bucket and its columnEntries array are about to
     // be destroyed entirely, so there is nothing left to persist.
     // materialisePendingInsert() already removed the pending insert from the
     // global count; bulk-account only for the remaining bucket entries.
@@ -4387,21 +4284,20 @@ static std::vector<Expression> flushBucket(
       }
     }
 
-    // V2P: build the final physical Update directly from the selected
-    // columns, without ever writing them into bucket.columnEntries.
+    // Build the physical Update directly from the selected columns.
     if(auto update = buildUpdateFromResolvedColumns(bucket, selected)) {
       result.push_back(std::move(*update));
     }
 
-    // Persist only the surviving columns. The old (pre-resolution) entries
-    // for every column — including the ones just flushed — are discarded
+    // Persist only the surviving columns. The old pre-resolution entries,
+    // including the ones just flushed, are discarded
     // here; the flushed ones don't need to be written back at all.
     unregisterAllCellReverseDependencies(bucket);
     clearBucketDependencySummary(bucket);
     bucket.columnEntries.clear();
     for(auto& rc : surviving) {
       auto [colPtr, colInserted] = bucket.columnEntries.try_emplace(rc.colId);
-      if(!colPtr) continue; // too many columns — should not happen for OLTP
+      if(!colPtr) continue; // The fixed-size column collection is full.
       auto& colEntries = colPtr->entries;
 
       if(colInserted) {
@@ -4846,8 +4742,6 @@ static void appendPlannedMaterialisation(
 }
 
 static Expression flushAllBuckets(FlushReason reason = FlushReason::Manual) {
-  // commented out for better testing output
-  // std::cout << "WAL: flushing all " << walTotalEntries << " entries" << std::endl;
   boss::ExpressionArguments entries;
   // Copy keys because flushBucket modifies walIndex (erases buckets)
   std::vector<WALKey> keys;
@@ -4858,8 +4752,6 @@ static Expression flushAllBuckets(FlushReason reason = FlushReason::Manual) {
     auto flushed = flushBucket(key, {}, reason);
     for(auto& e : flushed) entries.push_back(std::move(e));
   }
-  // commented out for better testing output
-  // std::cout << "WAL: emitting " << entries.size() << " entries" << std::endl;
   return ComplexExpression("ApplyWAL"_, {}, std::move(entries), {});
 }
 
@@ -5070,9 +4962,6 @@ static Expression evaluate(Expression &&e) {
             walIndexPush(key, ComplexExpression("Update"_, {}, std::move(walArgs), {}));
           }
 
-          // commented out for better testing output
-          // std::cout << "WAL: captured Update" << std::endl;
-
           // check if WAL has hit the threshold - if so flush to Arrow storage
           if(walTotalEntries >= WAL_THRESHOLD) {
             return flushAllBuckets(FlushReason::GlobalThreshold);
@@ -5110,15 +4999,6 @@ static Expression evaluate(Expression &&e) {
           if(!idListExpr) return std::move(expr);
 
           visitRowIDs(*idListExpr, [&](auto idValue) {
-            // boss::ExpressionArguments walArgs;
-            // walArgs.push_back(*tableSymbol);
-            // boss::ExpressionArguments idListArgs;
-            // idListArgs.push_back(idValue);  // preserves original type
-            // auto idList = ComplexExpression("List"_, {}, std::move(idListArgs), {});
-            // boss::ExpressionArguments idColArgs;
-            // idColArgs.push_back(std::move(idList));
-            // walArgs.push_back(ComplexExpression(idColName, {}, std::move(idColArgs), {}));
-            // writeAheadLog.push_back(ComplexExpression("Delete"_, {}, std::move(walArgs), {}));
             WALKey key{internTableName(tableSymbol->getName()), static_cast<int64_t>(idValue)};
             boss::ExpressionArguments walArgs;
             walArgs.push_back(*tableSymbol);
@@ -5131,9 +5011,6 @@ static Expression evaluate(Expression &&e) {
             walIndexPush(key, ComplexExpression("Delete"_, {}, std::move(walArgs), {}));
           });
 
-          // commented out for better testing output
-          // std::cout << "WAL: captured Delete" << std::endl;
-
           // check if WAL has hit the threshold - if so flush to Arrow storage
           if(walTotalEntries >= WAL_THRESHOLD) {
             return flushAllBuckets(FlushReason::GlobalThreshold);
@@ -5141,7 +5018,7 @@ static Expression evaluate(Expression &&e) {
           return "Delete_Logged"_();
         }
 
-        // GetWAL — return non-consuming metadata summaries flattened in seq order
+        // GetWAL returns non-consuming metadata summaries in sequence order.
         if (head == "GetWAL"_) {
           boss::ExpressionArguments entries;
           std::vector<OperationId> seenOperations;
@@ -5196,7 +5073,7 @@ static Expression evaluate(Expression &&e) {
             std::sort(allEntries.begin(), allEntries.end(),
               [](auto const& a, auto const& b) { return a.first < b.first; });
 
-            // deduplicate — multiple columns in same Update share same seq
+            // Deduplicate because multiple columns in the same Update share a sequence.
             // we only want to emit each Update expression once
             int lastSeq = -1;
             for(auto& [seq, expr] : allEntries) {
@@ -5206,19 +5083,17 @@ static Expression evaluate(Expression &&e) {
               }
             }
           }
-          // commented out for better testing output
-          // std::cout << "WAL: returning " << entries.size() << " raw entries" << std::endl;
           return ComplexExpression("List"_, {}, std::move(entries), {});
         }
 
-        // ResetWALStats — reset instrumentation counters only.
+        // ResetWALStats resets instrumentation counters only.
         // Does not clear the WAL itself.
         if(head == "ResetWALStats"_) {
           resetWALStats();
           return "WALStats_Reset"_();
         }
 
-        // PrintWALStats(label?) — print instrumentation counters.
+        // PrintWALStats(label?) prints instrumentation counters.
         // Optional label can be a string or Symbol.
         if(head == "PrintWALStats"_) {
           std::string label;
@@ -5258,10 +5133,8 @@ static Expression evaluate(Expression &&e) {
           nextColumnId = 0;
           return "WAL_Cleared"_();
         }
-        // OptimiseWAL — compact every bucket in place, WAL stays alive
+        // OptimiseWAL compacts every bucket in place while the WAL stays active.
         if(head == "OptimiseWAL"_) {
-          // commented out for better testing output
-          // std::cout << "WAL: optimising " << walTotalEntries << " entries" << std::endl;
           for(auto& [key, bucket] : walIndex) {
             if(selectedColumnsContainSharedRefs(bucket, {})) {
               continue;
@@ -5284,8 +5157,6 @@ static Expression evaluate(Expression &&e) {
             walTotalEntries -= countBefore;
             walTotalEntries += countAfter;
           }
-          // commented out for better testing output
-          // std::cout << "WAL: " << walTotalEntries << " entries after optimisation" << std::endl;
           return "WAL_Optimised"_();
         }
 
@@ -5348,7 +5219,7 @@ static Expression evaluate(Expression &&e) {
         }
 
         // Select - triggers WAL flush before read
-        // bare Select flushes the whole row — no column filter
+        // A bare Select flushes the whole row because it has no column filter.
         if(head == "Select"_) {
           auto plan = extractSelectPlan(expr);
           boss::ExpressionArguments applyArgs;
@@ -5381,12 +5252,12 @@ static Expression evaluate(Expression &&e) {
 
         // for flushing the WAL
         if(head == "FlushWAL"_) {
-          // FlushWAL() — flush everything
+          // FlushWAL() flushes everything.
           if(args.size() == 0) {
             return flushAllBuckets(FlushReason::Manual);
           }
 
-          // FlushWAL(tableName, rowId) — flush only one specific row
+          // FlushWAL(tableName, rowId) flushes one specific row.
           if(args.size() == 2) {
             auto const& tableArg = args[0];
             auto const* tableSymbol = get_if<Symbol>(&tableArg);
