@@ -1,0 +1,35 @@
+# started on Mon Aug 31 15:26:29 2026
+
+
+ Performance counter stats for 'taskset -c 8 ./build/BOSS-prefix/src/BOSS-build/Tests Benchmark Figure 4 - External Read Latency CDF (Uniform) --library build/libBOSSTransactionLogEngine.so --library BOSSInMemoryWriteEngine/build/libBOSSInMemoryWriteEngine.so':
+
+    46,966,751,540      task-clock                       #    0.999 CPUs utilized             
+               403      context-switches                 #    8.581 /sec                      
+                 1      cpu-migrations                   #    0.021 /sec                      
+           104,800      page-faults                      #    2.231 K/sec                     
+     <not counted>      cpu_atom/instructions/                                                  (0.00%)
+   672,192,655,318      cpu_core/instructions/           #    2.76  insn per cycle            
+     <not counted>      cpu_atom/cycles/                                                        (0.00%)
+   243,193,104,092      cpu_core/cycles/                 #    5.178 GHz                       
+     <not counted>      cpu_atom/branches/                                                      (0.00%)
+   145,471,948,406      cpu_core/branches/               #    3.097 G/sec                     
+     <not counted>      cpu_atom/branch-misses/                                                 (0.00%)
+       110,788,353      cpu_core/branch-misses/          #    0.08% of all branches           
+ #      4.6 %  tma_backend_bound      
+                                                  #      2.7 %  tma_bad_speculation    
+                                                  #     47.3 %  tma_frontend_bound     
+                                                  #     45.4 %  tma_retiring           
+     <not counted>      cpu_atom/L1-dcache-loads/                                               (0.00%)
+   178,018,978,091      cpu_core/L1-dcache-loads/        #    3.790 G/sec                     
+       823,146,722      cpu_core/L1-dcache-load-misses/  #    0.46% of all L1-dcache accesses 
+     <not counted>      cpu_atom/LLC-loads/                                                     (0.00%)
+       248,984,820      cpu_core/LLC-loads/              #    5.301 M/sec                     
+     <not counted>      cpu_atom/LLC-load-misses/                                               (0.00%)
+        94,332,817      cpu_core/LLC-load-misses/        #   37.89% of all LL-cache accesses  
+
+      46.996023540 seconds time elapsed
+
+      46.858015000 seconds user
+       0.120963000 seconds sys
+
+

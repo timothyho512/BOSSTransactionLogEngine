@@ -1,0 +1,8 @@
+Filters: "Benchmark sanity check - correctness at small scale"
+Randomness seeded to: 3196948456
+InMemory: created table SmallStock
+
+Sanity check: verified 92 of 92 touched rows have value >= 1.0
+===============================================================================
+All tests passed (186 assertions in 1 test case)
+

@@ -1,0 +1,461 @@
+Filters: "TPC-C integrated higher-fidelity final state matches across eager and lazy modes"
+Randomness seeded to: 2949538528
+InMemory: created table TPCCWarehouse
+InMemory: created table TPCCDistrict
+InMemory: created table TPCCCustomer
+InMemory: created table TPCCItem
+InMemory: created table TPCCStock
+InMemory: created table TPCCOrder
+InMemory: created table TPCCNewOrder
+InMemory: created table TPCCOrderLine
+InMemory: created table TPCCHistory
+
+--- WAL Instrumentation: Correctness_TPCC_Integrated_Higher_Fidelity_Eager_500 ---
+walEntriesCreated          = 13031
+walEntriesFlushed          = 13031
+physicalUpdatesApplied     = 4575
+physicalInsertsApplied     = 2979
+physicalDeletesApplied     = 200
+dependencyEntriesConsumed  = 0
+dependencyPhysicalUpdates  = 0
+flushCalls                 = 7754
+readTriggeredFlushes       = 180
+readTriggeredWALEntries    = 180
+readRequests               = 10470
+pointReadRequests          = 10109
+wholeTableReadRequests     = 361
+unknownReadRequests        = 0
+readRequestsWithPending    = 180
+readPendingBucketsAtPlan   = 180
+readBucketsMaterialised    = 180
+readPhysicalExprsEmitted   = 180
+pointReadBucketsMaterialised = 0
+wholeReadBucketsMaterialised = 180
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 0
+readBucketsWithInsert      = 0
+readBucketsWithDelete      = 180
+readBucketsWithUpdates     = 0
+readBucketsWithSameRowDeps = 0
+readBucketsWithCrossRowDeps = 0
+readLifecycleOnlyBuckets   = 180
+readOneColumnBuckets       = 0
+readMultiColumnBuckets     = 0
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 180
+readEntryBuckets[2-4]      = 0
+readEntryBuckets[5-16]     = 0
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 0
+insertTriggeredFlushes     = 0
+globalThresholdFlushes     = 0
+manualFlushes              = 7574
+otherFlushes               = 0
+insertDrainCalls           = 0
+insertRowsDrained          = 0
+peakPendingInsertRows      = 17
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 0
+avgEntriesPerFlush         = 1.68055
+maxEntriesInSingleFlush    = 6
+walToPhysicalUpdateRatio   = 2.84831x
+pendingWALEntriesNow       = 0
+readTable[TPCCDistrict] point=245 whole=0 pending=0 materialised=0 pointMat=0 wholeMat=0 insert=0 update=0 delete=0 emitted=0
+readTable[TPCCCustomer] point=114 whole=141 pending=0 materialised=0 pointMat=0 wholeMat=0 insert=0 update=0 delete=0 emitted=0
+readTable[TPCCOrder] point=600 whole=20 pending=0 materialised=0 pointMat=0 wholeMat=0 insert=0 update=0 delete=0 emitted=0
+readTable[TPCCOrderLine] point=4346 whole=0 pending=0 materialised=0 pointMat=0 wholeMat=0 insert=0 update=0 delete=0 emitted=0
+readTable[TPCCNewOrder] point=0 whole=200 pending=180 materialised=180 pointMat=0 wholeMat=180 insert=0 update=0 delete=180 emitted=180
+readTable[TPCCItem] point=2337 whole=0 pending=0 materialised=0 pointMat=0 wholeMat=0 insert=0 update=0 delete=0 emitted=0
+readTable[TPCCStock] point=2467 whole=0 pending=0 materialised=0 pointMat=0 wholeMat=0 insert=0 update=0 delete=0 emitted=0
+------------------------------------------
+
+=== InMemory Stats: Correctness_TPCC_Integrated_Higher_Fidelity_Eager_500 ===
+physicalUpdateRows      = 4575
+indexRowsInserted       = 446
+indexRowsRemoved        = 200
+indexRowsRekeyed        = 0
+selectRowsRead          = 11737
+boundSelectScans        = 0
+genericSelectScans      = 0
+selectPointReadRequests = 10109
+selectPointReadHits     = 10107
+selectPointReadMisses   = 2
+indexLookupRequests     = 361
+indexPrefixLookups      = 361
+indexExactLookups       = 0
+indexLookupHits         = 361
+indexLookupMisses       = 0
+indexCandidatesExamined = 1630
+selectScansAvoided      = 361
+selectScanRequests      = 0
+selectCandidatesExamined = 1630
+selectRowsMatched       = 1630
+selectResultRowsBuilt   = 11737
+selectResultCellsBuilt  = 100774
+topOneRequests          = 220
+topOneIndexLookups      = 220
+topOneScanFallbacks     = 0
+topOneCandidatesExamined = 220
+projectedResultRowsBuilt = 220
+projectedResultCellsBuilt = 500
+selectTable[TPCCCustomer] pointRequests=114 pointHits=114 pointMisses=0 indexLookups=141 indexPrefix=141 indexExact=0 indexHits=141 indexMisses=0 indexCandidates=1410 scansAvoided=141 scans=0 candidates=1410 matched=1410 resultRows=1524 resultCells=18288 topOneRequests=0 topOneIndexLookups=0 topOneScanFallbacks=0 topOneCandidates=0 projectedRows=0 projectedCells=0
+selectTable[TPCCDistrict] pointRequests=245 pointHits=245 pointMisses=0 indexLookups=0 indexPrefix=0 indexExact=0 indexHits=0 indexMisses=0 indexCandidates=0 scansAvoided=0 scans=0 candidates=0 matched=0 resultRows=245 resultCells=1715 topOneRequests=0 topOneIndexLookups=0 topOneScanFallbacks=0 topOneCandidates=0 projectedRows=0 projectedCells=0
+selectTable[TPCCItem] pointRequests=2337 pointHits=2335 pointMisses=2 indexLookups=0 indexPrefix=0 indexExact=0 indexHits=0 indexMisses=0 indexCandidates=0 scansAvoided=0 scans=0 candidates=0 matched=0 resultRows=2335 resultCells=11675 topOneRequests=0 topOneIndexLookups=0 topOneScanFallbacks=0 topOneCandidates=0 projectedRows=0 projectedCells=0
+selectTable[TPCCNewOrder] pointRequests=0 pointHits=0 pointMisses=0 indexLookups=200 indexPrefix=200 indexExact=0 indexHits=200 indexMisses=0 indexCandidates=200 scansAvoided=200 scans=0 candidates=200 matched=200 resultRows=200 resultCells=400 topOneRequests=200 topOneIndexLookups=200 topOneScanFallbacks=0 topOneCandidates=200 projectedRows=200 projectedCells=400
+selectTable[TPCCOrder] pointRequests=600 pointHits=600 pointMisses=0 indexLookups=20 indexPrefix=20 indexExact=0 indexHits=20 indexMisses=0 indexCandidates=20 scansAvoided=20 scans=0 candidates=20 matched=20 resultRows=620 resultCells=5500 topOneRequests=20 topOneIndexLookups=20 topOneScanFallbacks=0 topOneCandidates=20 projectedRows=20 projectedCells=100
+selectTable[TPCCOrderLine] pointRequests=4346 pointHits=4346 pointMisses=0 indexLookups=0 indexPrefix=0 indexExact=0 indexHits=0 indexMisses=0 indexCandidates=0 scansAvoided=0 scans=0 candidates=0 matched=0 resultRows=4346 resultCells=43460 topOneRequests=0 topOneIndexLookups=0 topOneScanFallbacks=0 topOneCandidates=0 projectedRows=0 projectedCells=0
+selectTable[TPCCStock] pointRequests=2467 pointHits=2467 pointMisses=0 indexLookups=0 indexPrefix=0 indexExact=0 indexHits=0 indexMisses=0 indexCandidates=0 scansAvoided=0 scans=0 candidates=0 matched=0 resultRows=2467 resultCells=19736 topOneRequests=0 topOneIndexLookups=0 topOneScanFallbacks=0 topOneCandidates=0 projectedRows=0 projectedCells=0
+payloadTouches          = 0
+payloadBytesTouched     = 0
+payloadChecksum         = 0
+totalPayloadBytes       = 0
+
+=== TPC-C mixed external-read profile ===
+Label                       = Correctness_TPCC_Integrated_Higher_Fidelity_Eager_500
+Mode                        = Eager
+Warehouses                  = 1
+Districts                   = 10
+Customers/district          = 100
+Items                       = 1000
+NewOrder txns               = 225
+NewOrder seed               = 20260821
+NewOrder accepted           = 223
+NewOrder rejected           = 2
+NewOrder invalid percentage = 0.888889%
+NewOrder lines min          = 5
+NewOrder lines max          = 15
+NewOrder lines avg          = 10.3867
+Item validation reads       = 2337
+Payment txns                = 215
+Customer lookup seed        = 20260820
+Payment last-name lookups   = 129
+Payment customer-ID lookups = 86
+OrderStatus txns            = 20
+OrderStatus last-name lookups = 12
+OrderStatus customer-ID lookups = 8
+OrderStatus avg latency us  = 53.8546
+OrderStatus p50 latency us  = 58.082
+OrderStatus p95 latency us  = 64.468
+StockLevel txns             = 20
+StockLevel avg latency us   = 716.551
+StockLevel p50 latency us   = 745.067
+StockLevel p95 latency us   = 1013.86
+Delivery txns               = 20
+Delivery avg latency us     = 352.827
+Delivery p50 latency us     = 347.739
+Delivery p95 latency us     = 357.793
+Chain length                = 1
+Insert drain rows           = 0
+Explicit flush requests     = 459
+Selective chain flushes     = 0
+TOTAL_TRANSACTIONS          = 500
+Elapsed seconds             = 0.0647198
+Throughput                  = 7725 txns/s
+============================================
+InMemory: created table TPCCWarehouse
+InMemory: created table TPCCDistrict
+InMemory: created table TPCCCustomer
+InMemory: created table TPCCItem
+InMemory: created table TPCCStock
+InMemory: created table TPCCOrder
+InMemory: created table TPCCNewOrder
+InMemory: created table TPCCOrderLine
+InMemory: created table TPCCHistory
+
+--- WAL Instrumentation: Correctness_TPCC_Integrated_Higher_Fidelity_Lazy_1_500 ---
+walEntriesCreated          = 13031
+walEntriesFlushed          = 13031
+physicalUpdatesApplied     = 4575
+physicalInsertsApplied     = 2979
+physicalDeletesApplied     = 200
+dependencyEntriesConsumed  = 0
+dependencyPhysicalUpdates  = 0
+flushCalls                 = 7754
+readTriggeredFlushes       = 404
+readTriggeredWALEntries    = 404
+readRequests               = 10470
+pointReadRequests          = 10109
+wholeTableReadRequests     = 361
+unknownReadRequests        = 0
+readRequestsWithPending    = 233
+readPendingBucketsAtPlan   = 404
+readBucketsMaterialised    = 404
+readPhysicalExprsEmitted   = 404
+pointReadBucketsMaterialised = 15
+wholeReadBucketsMaterialised = 389
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 190
+readBucketsWithInsert      = 0
+readBucketsWithDelete      = 199
+readBucketsWithUpdates     = 205
+readBucketsWithSameRowDeps = 0
+readBucketsWithCrossRowDeps = 0
+readLifecycleOnlyBuckets   = 199
+readOneColumnBuckets       = 205
+readMultiColumnBuckets     = 0
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 404
+readEntryBuckets[2-4]      = 0
+readEntryBuckets[5-16]     = 0
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 3375
+insertTriggeredFlushes     = 2979
+globalThresholdFlushes     = 0
+manualFlushes              = 996
+otherFlushes               = 0
+insertDrainCalls           = 2979
+insertRowsDrained          = 2979
+peakPendingInsertRows      = 1
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 1
+avgEntriesPerFlush         = 1.68055
+maxEntriesInSingleFlush    = 6
+walToPhysicalUpdateRatio   = 2.84831x
+pendingWALEntriesNow       = 0
+readTable[TPCCDistrict] point=245 whole=0 pending=0 materialised=0 pointMat=0 wholeMat=0 insert=0 update=0 delete=0 emitted=0
+readTable[TPCCCustomer] point=114 whole=141 pending=0 materialised=0 pointMat=0 wholeMat=0 insert=0 update=0 delete=0 emitted=0
+readTable[TPCCOrder] point=600 whole=20 pending=190 materialised=190 pointMat=0 wholeMat=190 insert=0 update=190 delete=0 emitted=190
+readTable[TPCCOrderLine] point=4346 whole=0 pending=15 materialised=15 pointMat=15 wholeMat=0 insert=0 update=15 delete=0 emitted=15
+readTable[TPCCNewOrder] point=0 whole=200 pending=199 materialised=199 pointMat=0 wholeMat=199 insert=0 update=0 delete=199 emitted=199
+readTable[TPCCItem] point=2337 whole=0 pending=0 materialised=0 pointMat=0 wholeMat=0 insert=0 update=0 delete=0 emitted=0
+readTable[TPCCStock] point=2467 whole=0 pending=0 materialised=0 pointMat=0 wholeMat=0 insert=0 update=0 delete=0 emitted=0
+------------------------------------------
+
+=== InMemory Stats: Correctness_TPCC_Integrated_Higher_Fidelity_Lazy_1_500 ===
+physicalUpdateRows      = 4575
+indexRowsInserted       = 446
+indexRowsRemoved        = 200
+indexRowsRekeyed        = 0
+selectRowsRead          = 11737
+boundSelectScans        = 0
+genericSelectScans      = 0
+selectPointReadRequests = 10109
+selectPointReadHits     = 10107
+selectPointReadMisses   = 2
+indexLookupRequests     = 361
+indexPrefixLookups      = 361
+indexExactLookups       = 0
+indexLookupHits         = 361
+indexLookupMisses       = 0
+indexCandidatesExamined = 1630
+selectScansAvoided      = 361
+selectScanRequests      = 0
+selectCandidatesExamined = 1630
+selectRowsMatched       = 1630
+selectResultRowsBuilt   = 11737
+selectResultCellsBuilt  = 100774
+topOneRequests          = 220
+topOneIndexLookups      = 220
+topOneScanFallbacks     = 0
+topOneCandidatesExamined = 220
+projectedResultRowsBuilt = 220
+projectedResultCellsBuilt = 500
+selectTable[TPCCCustomer] pointRequests=114 pointHits=114 pointMisses=0 indexLookups=141 indexPrefix=141 indexExact=0 indexHits=141 indexMisses=0 indexCandidates=1410 scansAvoided=141 scans=0 candidates=1410 matched=1410 resultRows=1524 resultCells=18288 topOneRequests=0 topOneIndexLookups=0 topOneScanFallbacks=0 topOneCandidates=0 projectedRows=0 projectedCells=0
+selectTable[TPCCDistrict] pointRequests=245 pointHits=245 pointMisses=0 indexLookups=0 indexPrefix=0 indexExact=0 indexHits=0 indexMisses=0 indexCandidates=0 scansAvoided=0 scans=0 candidates=0 matched=0 resultRows=245 resultCells=1715 topOneRequests=0 topOneIndexLookups=0 topOneScanFallbacks=0 topOneCandidates=0 projectedRows=0 projectedCells=0
+selectTable[TPCCItem] pointRequests=2337 pointHits=2335 pointMisses=2 indexLookups=0 indexPrefix=0 indexExact=0 indexHits=0 indexMisses=0 indexCandidates=0 scansAvoided=0 scans=0 candidates=0 matched=0 resultRows=2335 resultCells=11675 topOneRequests=0 topOneIndexLookups=0 topOneScanFallbacks=0 topOneCandidates=0 projectedRows=0 projectedCells=0
+selectTable[TPCCNewOrder] pointRequests=0 pointHits=0 pointMisses=0 indexLookups=200 indexPrefix=200 indexExact=0 indexHits=200 indexMisses=0 indexCandidates=200 scansAvoided=200 scans=0 candidates=200 matched=200 resultRows=200 resultCells=400 topOneRequests=200 topOneIndexLookups=200 topOneScanFallbacks=0 topOneCandidates=200 projectedRows=200 projectedCells=400
+selectTable[TPCCOrder] pointRequests=600 pointHits=600 pointMisses=0 indexLookups=20 indexPrefix=20 indexExact=0 indexHits=20 indexMisses=0 indexCandidates=20 scansAvoided=20 scans=0 candidates=20 matched=20 resultRows=620 resultCells=5500 topOneRequests=20 topOneIndexLookups=20 topOneScanFallbacks=0 topOneCandidates=20 projectedRows=20 projectedCells=100
+selectTable[TPCCOrderLine] pointRequests=4346 pointHits=4346 pointMisses=0 indexLookups=0 indexPrefix=0 indexExact=0 indexHits=0 indexMisses=0 indexCandidates=0 scansAvoided=0 scans=0 candidates=0 matched=0 resultRows=4346 resultCells=43460 topOneRequests=0 topOneIndexLookups=0 topOneScanFallbacks=0 topOneCandidates=0 projectedRows=0 projectedCells=0
+selectTable[TPCCStock] pointRequests=2467 pointHits=2467 pointMisses=0 indexLookups=0 indexPrefix=0 indexExact=0 indexHits=0 indexMisses=0 indexCandidates=0 scansAvoided=0 scans=0 candidates=0 matched=0 resultRows=2467 resultCells=19736 topOneRequests=0 topOneIndexLookups=0 topOneScanFallbacks=0 topOneCandidates=0 projectedRows=0 projectedCells=0
+payloadTouches          = 0
+payloadBytesTouched     = 0
+payloadChecksum         = 0
+totalPayloadBytes       = 0
+
+=== TPC-C mixed external-read profile ===
+Label                       = Correctness_TPCC_Integrated_Higher_Fidelity_Lazy_1_500
+Mode                        = Lazy
+Warehouses                  = 1
+Districts                   = 10
+Customers/district          = 100
+Items                       = 1000
+NewOrder txns               = 225
+NewOrder seed               = 20260821
+NewOrder accepted           = 223
+NewOrder rejected           = 2
+NewOrder invalid percentage = 0.888889%
+NewOrder lines min          = 5
+NewOrder lines max          = 15
+NewOrder lines avg          = 10.3867
+Item validation reads       = 2337
+Payment txns                = 215
+Customer lookup seed        = 20260820
+Payment last-name lookups   = 129
+Payment customer-ID lookups = 86
+OrderStatus txns            = 20
+OrderStatus last-name lookups = 12
+OrderStatus customer-ID lookups = 8
+OrderStatus avg latency us  = 64.3204
+OrderStatus p50 latency us  = 69.58
+OrderStatus p95 latency us  = 77.01
+StockLevel txns             = 20
+StockLevel avg latency us   = 711.648
+StockLevel p50 latency us   = 755.314
+StockLevel p95 latency us   = 1008.34
+Delivery txns               = 20
+Delivery avg latency us     = 350.007
+Delivery p50 latency us     = 349.193
+Delivery p95 latency us     = 357.947
+Chain length                = 1
+Insert drain rows           = 1
+Explicit flush requests     = 3387
+Selective chain flushes     = 3386
+TOTAL_TRANSACTIONS          = 500
+Elapsed seconds             = 0.0661887
+Throughput                  = 7554 txns/s
+============================================
+InMemory: created table TPCCWarehouse
+InMemory: created table TPCCDistrict
+InMemory: created table TPCCCustomer
+InMemory: created table TPCCItem
+InMemory: created table TPCCStock
+InMemory: created table TPCCOrder
+InMemory: created table TPCCNewOrder
+InMemory: created table TPCCOrderLine
+InMemory: created table TPCCHistory
+
+--- WAL Instrumentation: Correctness_TPCC_Integrated_Higher_Fidelity_Lazy_100_500 ---
+walEntriesCreated          = 13031
+walEntriesFlushed          = 13026
+physicalUpdatesApplied     = 3447
+physicalInsertsApplied     = 2979
+physicalDeletesApplied     = 200
+dependencyEntriesConsumed  = 0
+dependencyPhysicalUpdates  = 0
+flushCalls                 = 6635
+readTriggeredFlushes       = 3212
+readTriggeredWALEntries    = 7967
+readRequests               = 10470
+pointReadRequests          = 10109
+wholeTableReadRequests     = 361
+unknownReadRequests        = 0
+readRequestsWithPending    = 2635
+readPendingBucketsAtPlan   = 3212
+readBucketsMaterialised    = 3212
+readPhysicalExprsEmitted   = 3203
+pointReadBucketsMaterialised = 2415
+wholeReadBucketsMaterialised = 797
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 210
+readBucketsWithInsert      = 1144
+readBucketsWithDelete      = 199
+readBucketsWithUpdates     = 1869
+readBucketsWithSameRowDeps = 0
+readBucketsWithCrossRowDeps = 0
+readLifecycleOnlyBuckets   = 1343
+readOneColumnBuckets       = 314
+readMultiColumnBuckets     = 1555
+readEntryBuckets[0]        = 9
+readEntryBuckets[1]        = 1661
+readEntryBuckets[2-4]      = 1081
+readEntryBuckets[5-16]     = 461
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 2
+insertTriggeredFlushes     = 1400
+globalThresholdFlushes     = 0
+manualFlushes              = 2021
+otherFlushes               = 0
+insertDrainCalls           = 2
+insertRowsDrained          = 1400
+peakPendingInsertRows      = 700
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 700
+avgEntriesPerFlush         = 1.96323
+maxEntriesInSingleFlush    = 100
+walToPhysicalUpdateRatio   = 3.77894x
+pendingWALEntriesNow       = 0
+readTable[TPCCDistrict] point=245 whole=0 pending=231 materialised=231 pointMat=231 wholeMat=0 insert=0 update=231 delete=0 emitted=231
+readTable[TPCCCustomer] point=114 whole=141 pending=20 materialised=20 pointMat=20 wholeMat=0 insert=0 update=20 delete=0 emitted=11
+readTable[TPCCOrder] point=600 whole=20 pending=394 materialised=394 pointMat=0 wholeMat=394 insert=204 update=190 delete=0 emitted=394
+readTable[TPCCOrderLine] point=4346 whole=0 pending=751 materialised=751 pointMat=751 wholeMat=0 insert=736 update=15 delete=0 emitted=751
+readTable[TPCCNewOrder] point=0 whole=200 pending=403 materialised=403 pointMat=0 wholeMat=403 insert=204 update=0 delete=199 emitted=403
+readTable[TPCCItem] point=2337 whole=0 pending=0 materialised=0 pointMat=0 wholeMat=0 insert=0 update=0 delete=0 emitted=0
+readTable[TPCCStock] point=2467 whole=0 pending=1413 materialised=1413 pointMat=1413 wholeMat=0 insert=0 update=1413 delete=0 emitted=1413
+------------------------------------------
+
+=== InMemory Stats: Correctness_TPCC_Integrated_Higher_Fidelity_Lazy_100_500 ===
+physicalUpdateRows      = 3447
+indexRowsInserted       = 446
+indexRowsRemoved        = 200
+indexRowsRekeyed        = 0
+selectRowsRead          = 11737
+boundSelectScans        = 0
+genericSelectScans      = 0
+selectPointReadRequests = 10109
+selectPointReadHits     = 10107
+selectPointReadMisses   = 2
+indexLookupRequests     = 361
+indexPrefixLookups      = 361
+indexExactLookups       = 0
+indexLookupHits         = 361
+indexLookupMisses       = 0
+indexCandidatesExamined = 1630
+selectScansAvoided      = 361
+selectScanRequests      = 0
+selectCandidatesExamined = 1630
+selectRowsMatched       = 1630
+selectResultRowsBuilt   = 11737
+selectResultCellsBuilt  = 100774
+topOneRequests          = 220
+topOneIndexLookups      = 220
+topOneScanFallbacks     = 0
+topOneCandidatesExamined = 220
+projectedResultRowsBuilt = 220
+projectedResultCellsBuilt = 500
+selectTable[TPCCCustomer] pointRequests=114 pointHits=114 pointMisses=0 indexLookups=141 indexPrefix=141 indexExact=0 indexHits=141 indexMisses=0 indexCandidates=1410 scansAvoided=141 scans=0 candidates=1410 matched=1410 resultRows=1524 resultCells=18288 topOneRequests=0 topOneIndexLookups=0 topOneScanFallbacks=0 topOneCandidates=0 projectedRows=0 projectedCells=0
+selectTable[TPCCDistrict] pointRequests=245 pointHits=245 pointMisses=0 indexLookups=0 indexPrefix=0 indexExact=0 indexHits=0 indexMisses=0 indexCandidates=0 scansAvoided=0 scans=0 candidates=0 matched=0 resultRows=245 resultCells=1715 topOneRequests=0 topOneIndexLookups=0 topOneScanFallbacks=0 topOneCandidates=0 projectedRows=0 projectedCells=0
+selectTable[TPCCItem] pointRequests=2337 pointHits=2335 pointMisses=2 indexLookups=0 indexPrefix=0 indexExact=0 indexHits=0 indexMisses=0 indexCandidates=0 scansAvoided=0 scans=0 candidates=0 matched=0 resultRows=2335 resultCells=11675 topOneRequests=0 topOneIndexLookups=0 topOneScanFallbacks=0 topOneCandidates=0 projectedRows=0 projectedCells=0
+selectTable[TPCCNewOrder] pointRequests=0 pointHits=0 pointMisses=0 indexLookups=200 indexPrefix=200 indexExact=0 indexHits=200 indexMisses=0 indexCandidates=200 scansAvoided=200 scans=0 candidates=200 matched=200 resultRows=200 resultCells=400 topOneRequests=200 topOneIndexLookups=200 topOneScanFallbacks=0 topOneCandidates=200 projectedRows=200 projectedCells=400
+selectTable[TPCCOrder] pointRequests=600 pointHits=600 pointMisses=0 indexLookups=20 indexPrefix=20 indexExact=0 indexHits=20 indexMisses=0 indexCandidates=20 scansAvoided=20 scans=0 candidates=20 matched=20 resultRows=620 resultCells=5500 topOneRequests=20 topOneIndexLookups=20 topOneScanFallbacks=0 topOneCandidates=20 projectedRows=20 projectedCells=100
+selectTable[TPCCOrderLine] pointRequests=4346 pointHits=4346 pointMisses=0 indexLookups=0 indexPrefix=0 indexExact=0 indexHits=0 indexMisses=0 indexCandidates=0 scansAvoided=0 scans=0 candidates=0 matched=0 resultRows=4346 resultCells=43460 topOneRequests=0 topOneIndexLookups=0 topOneScanFallbacks=0 topOneCandidates=0 projectedRows=0 projectedCells=0
+selectTable[TPCCStock] pointRequests=2467 pointHits=2467 pointMisses=0 indexLookups=0 indexPrefix=0 indexExact=0 indexHits=0 indexMisses=0 indexCandidates=0 scansAvoided=0 scans=0 candidates=0 matched=0 resultRows=2467 resultCells=19736 topOneRequests=0 topOneIndexLookups=0 topOneScanFallbacks=0 topOneCandidates=0 projectedRows=0 projectedCells=0
+payloadTouches          = 0
+payloadBytesTouched     = 0
+payloadChecksum         = 0
+totalPayloadBytes       = 0
+
+=== TPC-C mixed external-read profile ===
+Label                       = Correctness_TPCC_Integrated_Higher_Fidelity_Lazy_100_500
+Mode                        = Lazy
+Warehouses                  = 1
+Districts                   = 10
+Customers/district          = 100
+Items                       = 1000
+NewOrder txns               = 225
+NewOrder seed               = 20260821
+NewOrder accepted           = 223
+NewOrder rejected           = 2
+NewOrder invalid percentage = 0.888889%
+NewOrder lines min          = 5
+NewOrder lines max          = 15
+NewOrder lines avg          = 10.3867
+Item validation reads       = 2337
+Payment txns                = 215
+Customer lookup seed        = 20260820
+Payment last-name lookups   = 129
+Payment customer-ID lookups = 86
+OrderStatus txns            = 20
+OrderStatus last-name lookups = 12
+OrderStatus customer-ID lookups = 8
+OrderStatus avg latency us  = 104.428
+OrderStatus p50 latency us  = 104.543
+OrderStatus p95 latency us  = 139.631
+StockLevel txns             = 20
+StockLevel avg latency us   = 1158.39
+StockLevel p50 latency us   = 1185.09
+StockLevel p95 latency us   = 1486.35
+Delivery txns               = 20
+Delivery avg latency us     = 376.764
+Delivery p50 latency us     = 376.724
+Delivery p95 latency us     = 383.979
+Chain length                = 100
+Insert drain rows           = 700
+Explicit flush requests     = 3
+Selective chain flushes     = 2
+TOTAL_TRANSACTIONS          = 500
+Elapsed seconds             = 0.0654091
+Throughput                  = 7644 txns/s
+============================================
+===============================================================================
+All tests passed (107 assertions in 1 test case)
+

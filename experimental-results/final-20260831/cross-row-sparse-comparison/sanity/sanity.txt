@@ -1,0 +1,77 @@
+Filters: "Sanity Dependency - Cross Row Direct Cell Small"
+Randomness seeded to: 744505920
+InMemory: created table Products
+InMemory: created table OrderLines
+
+--- WAL Instrumentation: Sanity_Dependency_CrossRow_DirectCell_small ---
+walEntriesCreated          = 20000
+walEntriesFlushed          = 2957
+physicalUpdatesApplied     = 19913
+physicalInsertsApplied     = 110
+physicalDeletesApplied     = 0
+dependencyEntriesConsumed  = 19917
+dependencyPhysicalUpdates  = 19877
+flushCalls                 = 1992
+readTriggeredFlushes       = 1966
+readTriggeredWALEntries    = 2924
+readRequests               = 1966
+pointReadRequests          = 1966
+wholeTableReadRequests     = 0
+unknownReadRequests        = 0
+readRequestsWithPending    = 1966
+readPendingBucketsAtPlan   = 1966
+readBucketsMaterialised    = 1966
+readPhysicalExprsEmitted   = 19964
+pointReadBucketsMaterialised = 1966
+wholeReadBucketsMaterialised = 0
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 1956
+readBucketsWithInsert      = 10
+readBucketsWithDelete      = 0
+readBucketsWithUpdates     = 1966
+readBucketsWithSameRowDeps = 1966
+readBucketsWithCrossRowDeps = 1966
+readLifecycleOnlyBuckets   = 0
+readOneColumnBuckets       = 1966
+readMultiColumnBuckets     = 0
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 1330
+readEntryBuckets[2-4]      = 611
+readEntryBuckets[5-16]     = 25
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 0
+insertTriggeredFlushes     = 0
+globalThresholdFlushes     = 0
+manualFlushes              = 26
+otherFlushes               = 0
+insertDrainCalls           = 0
+insertRowsDrained          = 0
+peakPendingInsertRows      = 110
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 0
+avgEntriesPerFlush         = 1.48444
+maxEntriesInSingleFlush    = 6
+walToPhysicalUpdateRatio   = 0.148496x
+dependencyEntryToUpdateRatio = 1.00201x
+pendingWALEntriesNow       = 0
+readTable[OrderLines] point=1966 whole=0 pending=1966 materialised=1966 pointMat=1966 wholeMat=0 insert=10 update=1966 delete=0 emitted=19964
+------------------------------------------
+
+=== Focused dependency profile case ===
+Label                    = Sanity_Dependency_CrossRow_DirectCell_small
+Workload shape           = small cross-row OrderLines.total reads Products.base_price
+Execution policy         = Lazy
+Engine path              = transaction engine + in-memory engine
+Materialisation policy   = read-triggered with final flush
+Dependency chain length  = 5 logical rounds
+Pattern width            = 20 WAL entries per logical txn
+Approx WAL per dependency chain = 10 per touched row
+Fanout                   = 0
+NUM_ROWS                 = 100
+NUM_PRODUCTS             = 10
+TOTAL_LOGICAL_TXNS       = 1000
+Scheduled dependency reads = 1966
+Throughput               = 13322 txns/s
+===============================================================================
+All tests passed (3 assertions in 1 test case)
+

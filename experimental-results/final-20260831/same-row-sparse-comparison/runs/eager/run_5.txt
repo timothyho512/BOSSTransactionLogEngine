@@ -1,0 +1,76 @@
+Filters: "Profile Dependency - Same Row Sparse Eager"
+Randomness seeded to: 3337083272
+InMemory: created table Stock
+
+--- WAL Instrumentation: Profile_Dependency_SameRow_Sparse_eager ---
+walEntriesCreated          = 5045099
+walEntriesFlushed          = 5025099
+physicalUpdatesApplied     = 2520000
+physicalInsertsApplied     = 0
+physicalDeletesApplied     = 0
+dependencyEntriesConsumed  = 60000
+dependencyPhysicalUpdates  = 40000
+flushCalls                 = 2500000
+readTriggeredFlushes       = 20000
+readTriggeredWALEntries    = 40000
+readRequests               = 20000
+pointReadRequests          = 20000
+wholeTableReadRequests     = 0
+unknownReadRequests        = 0
+readRequestsWithPending    = 20000
+readPendingBucketsAtPlan   = 20000
+readBucketsMaterialised    = 20000
+readPhysicalExprsEmitted   = 40000
+pointReadBucketsMaterialised = 20000
+wholeReadBucketsMaterialised = 0
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 20000
+readBucketsWithInsert      = 0
+readBucketsWithDelete      = 0
+readBucketsWithUpdates     = 20000
+readBucketsWithSameRowDeps = 20000
+readBucketsWithCrossRowDeps = 0
+readLifecycleOnlyBuckets   = 0
+readOneColumnBuckets       = 0
+readMultiColumnBuckets     = 20000
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 0
+readEntryBuckets[2-4]      = 20000
+readEntryBuckets[5-16]     = 0
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 0
+insertTriggeredFlushes     = 0
+globalThresholdFlushes     = 0
+manualFlushes              = 2480000
+otherFlushes               = 0
+insertDrainCalls           = 0
+insertRowsDrained          = 0
+peakPendingInsertRows      = 0
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 0
+avgEntriesPerFlush         = 2.01004
+maxEntriesInSingleFlush    = 3
+walToPhysicalUpdateRatio   = 1.99409x
+dependencyEntryToUpdateRatio = 1.5x
+pendingWALEntriesNow       = 0
+readTable[Stock] point=20000 whole=0 pending=20000 materialised=20000 pointMat=20000 wholeMat=0 insert=0 update=20000 delete=0 emitted=40000
+------------------------------------------
+
+=== Focused dependency profile case ===
+Label                    = Profile_Dependency_SameRow_Sparse_eager
+Workload shape           = same-row mostly foldable base/total chain with sparse total reads base
+Execution policy         = Eager
+Engine path              = transaction engine + in-memory engine
+Materialisation policy   = logical-transaction boundary and reads
+Dependency chain length  = 100 logical rounds
+Pattern width            = 20 WAL entries per logical txn
+Approx WAL per dependency chain = 200 per touched row
+Fanout                   = 0
+NUM_ROWS                 = 10000
+NUM_PRODUCTS             = 0
+TOTAL_LOGICAL_TXNS       = 250000
+Scheduled dependency reads = 20000
+Throughput               = 20338 txns/s
+===============================================================================
+All tests passed (2 assertions in 1 test case)
+

@@ -1,0 +1,77 @@
+Filters: "Profile Dependency - Cross Row Sparse Cell Eager"
+Randomness seeded to: 2569734182
+InMemory: created table Products
+InMemory: created table OrderLines
+
+--- WAL Instrumentation: Profile_Dependency_CrossRow_SparseCell_eager ---
+walEntriesCreated          = 5049499
+walEntriesFlushed          = 5024999
+physicalUpdatesApplied     = 5000000
+physicalInsertsApplied     = 0
+physicalDeletesApplied     = 0
+dependencyEntriesConsumed  = 73500
+dependencyPhysicalUpdates  = 49000
+flushCalls                 = 4975500
+readTriggeredFlushes       = 24500
+readTriggeredWALEntries    = 49000
+readRequests               = 24500
+pointReadRequests          = 24500
+wholeTableReadRequests     = 0
+unknownReadRequests        = 0
+readRequestsWithPending    = 24500
+readPendingBucketsAtPlan   = 24500
+readBucketsMaterialised    = 24500
+readPhysicalExprsEmitted   = 49000
+pointReadBucketsMaterialised = 24500
+wholeReadBucketsMaterialised = 0
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 24500
+readBucketsWithInsert      = 0
+readBucketsWithDelete      = 0
+readBucketsWithUpdates     = 24500
+readBucketsWithSameRowDeps = 0
+readBucketsWithCrossRowDeps = 24500
+readLifecycleOnlyBuckets   = 0
+readOneColumnBuckets       = 24500
+readMultiColumnBuckets     = 0
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 0
+readEntryBuckets[2-4]      = 24500
+readEntryBuckets[5-16]     = 0
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 0
+insertTriggeredFlushes     = 0
+globalThresholdFlushes     = 0
+manualFlushes              = 4951000
+otherFlushes               = 0
+insertDrainCalls           = 0
+insertRowsDrained          = 0
+peakPendingInsertRows      = 0
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 0
+avgEntriesPerFlush         = 1.00995
+maxEntriesInSingleFlush    = 2
+walToPhysicalUpdateRatio   = 1.005x
+dependencyEntryToUpdateRatio = 1.5x
+pendingWALEntriesNow       = 0
+readTable[OrderLines] point=24500 whole=0 pending=24500 materialised=24500 pointMat=24500 wholeMat=0 insert=0 update=24500 delete=0 emitted=49000
+------------------------------------------
+
+=== Focused dependency profile case ===
+Label                    = Profile_Dependency_CrossRow_SparseCell_eager
+Workload shape           = cross-row mostly foldable Product.price/OrderLines.total chain with sparse Cell(...)
+Execution policy         = Eager
+Engine path              = transaction engine + in-memory engine
+Materialisation policy   = logical-transaction boundary and reads
+Dependency chain length  = 100 logical rounds
+Pattern width            = 20 WAL entries per logical txn
+Approx WAL per dependency chain = 200 per touched row
+Fanout                   = 0
+NUM_ROWS                 = 1000
+NUM_PRODUCTS             = 1000
+TOTAL_LOGICAL_TXNS       = 250000
+Scheduled dependency reads = 24500
+Throughput               = 18359 txns/s
+===============================================================================
+All tests passed (2 assertions in 1 test case)
+

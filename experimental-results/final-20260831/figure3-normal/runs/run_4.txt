@@ -1,0 +1,565 @@
+Filters: "Benchmark Figure 3 - Throughput vs Chain Length (Normal σ=30)"
+Randomness seeded to: 1702906147
+
+=== BOSS Lazy Transaction Benchmark ===
+BOSS-adapted Faleiro et al. (SIGMOD 2014) §4.1 microbenchmark
+Parameters:
+  NUM_ROWS         = 10000
+  RECORDS_PER_TXN  = 10
+  TOTAL_TXNS       = 500000
+  NORMAL_SIGMA     = 30
+  READ_INTERVAL    = 500
+  CHAIN_LENGTHS    = {20, 40, 60, 80, 100}
+
+
+=== Figure 3 (Normal σ=30 workload) ===
+ChainLen  Lazy(txns/s)  Eager(txns/s)  Speedup
+--------  -----------  -------------  -------
+InMemory: created table Stock
+InMemory: populated table Stock with 10000 rows and 0 payload bytes/row
+
+--- WAL Instrumentation: Lazy_Figure3_Normal_chain_20 ---
+walEntriesCreated          = 5000000
+walEntriesFlushed          = 5000000
+physicalUpdatesApplied     = 254751
+physicalInsertsApplied     = 0
+physicalDeletesApplied     = 0
+dependencyEntriesConsumed  = 0
+dependencyPhysicalUpdates  = 0
+flushCalls                 = 254751
+readTriggeredFlushes       = 0
+readTriggeredWALEntries    = 0
+readRequests               = 0
+pointReadRequests          = 0
+wholeTableReadRequests     = 0
+unknownReadRequests        = 0
+readRequestsWithPending    = 0
+readPendingBucketsAtPlan   = 0
+readBucketsMaterialised    = 0
+readPhysicalExprsEmitted   = 0
+pointReadBucketsMaterialised = 0
+wholeReadBucketsMaterialised = 0
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 0
+readBucketsWithInsert      = 0
+readBucketsWithDelete      = 0
+readBucketsWithUpdates     = 0
+readBucketsWithSameRowDeps = 0
+readBucketsWithCrossRowDeps = 0
+readLifecycleOnlyBuckets   = 0
+readOneColumnBuckets       = 0
+readMultiColumnBuckets     = 0
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 0
+readEntryBuckets[2-4]      = 0
+readEntryBuckets[5-16]     = 0
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 0
+insertTriggeredFlushes     = 0
+globalThresholdFlushes     = 0
+manualFlushes              = 254751
+otherFlushes               = 0
+insertDrainCalls           = 0
+insertRowsDrained          = 0
+peakPendingInsertRows      = 0
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 0
+avgEntriesPerFlush         = 19.627
+maxEntriesInSingleFlush    = 20
+walToPhysicalUpdateRatio   = 19.627x
+pendingWALEntriesNow       = 0
+------------------------------------------
+InMemory: created table Stock
+InMemory: populated table Stock with 10000 rows and 0 payload bytes/row
+
+--- WAL Instrumentation: Eager_Figure3_Normal_chain_20 ---
+walEntriesCreated          = 5000000
+walEntriesFlushed          = 5000000
+physicalUpdatesApplied     = 5000000
+physicalInsertsApplied     = 0
+physicalDeletesApplied     = 0
+dependencyEntriesConsumed  = 0
+dependencyPhysicalUpdates  = 0
+flushCalls                 = 5000000
+readTriggeredFlushes       = 0
+readTriggeredWALEntries    = 0
+readRequests               = 0
+pointReadRequests          = 0
+wholeTableReadRequests     = 0
+unknownReadRequests        = 0
+readRequestsWithPending    = 0
+readPendingBucketsAtPlan   = 0
+readBucketsMaterialised    = 0
+readPhysicalExprsEmitted   = 0
+pointReadBucketsMaterialised = 0
+wholeReadBucketsMaterialised = 0
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 0
+readBucketsWithInsert      = 0
+readBucketsWithDelete      = 0
+readBucketsWithUpdates     = 0
+readBucketsWithSameRowDeps = 0
+readBucketsWithCrossRowDeps = 0
+readLifecycleOnlyBuckets   = 0
+readOneColumnBuckets       = 0
+readMultiColumnBuckets     = 0
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 0
+readEntryBuckets[2-4]      = 0
+readEntryBuckets[5-16]     = 0
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 0
+insertTriggeredFlushes     = 0
+globalThresholdFlushes     = 0
+manualFlushes              = 5000000
+otherFlushes               = 0
+insertDrainCalls           = 0
+insertRowsDrained          = 0
+peakPendingInsertRows      = 0
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 0
+avgEntriesPerFlush         = 1
+maxEntriesInSingleFlush    = 1
+walToPhysicalUpdateRatio   = 1x
+pendingWALEntriesNow       = 0
+------------------------------------------
+  20        44143        36661        1.2041x
+InMemory: created table Stock
+InMemory: populated table Stock with 10000 rows and 0 payload bytes/row
+
+--- WAL Instrumentation: Lazy_Figure3_Normal_chain_40 ---
+walEntriesCreated          = 5000000
+walEntriesFlushed          = 5000000
+physicalUpdatesApplied     = 129818
+physicalInsertsApplied     = 0
+physicalDeletesApplied     = 0
+dependencyEntriesConsumed  = 0
+dependencyPhysicalUpdates  = 0
+flushCalls                 = 129818
+readTriggeredFlushes       = 0
+readTriggeredWALEntries    = 0
+readRequests               = 0
+pointReadRequests          = 0
+wholeTableReadRequests     = 0
+unknownReadRequests        = 0
+readRequestsWithPending    = 0
+readPendingBucketsAtPlan   = 0
+readBucketsMaterialised    = 0
+readPhysicalExprsEmitted   = 0
+pointReadBucketsMaterialised = 0
+wholeReadBucketsMaterialised = 0
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 0
+readBucketsWithInsert      = 0
+readBucketsWithDelete      = 0
+readBucketsWithUpdates     = 0
+readBucketsWithSameRowDeps = 0
+readBucketsWithCrossRowDeps = 0
+readLifecycleOnlyBuckets   = 0
+readOneColumnBuckets       = 0
+readMultiColumnBuckets     = 0
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 0
+readEntryBuckets[2-4]      = 0
+readEntryBuckets[5-16]     = 0
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 0
+insertTriggeredFlushes     = 0
+globalThresholdFlushes     = 0
+manualFlushes              = 129818
+otherFlushes               = 0
+insertDrainCalls           = 0
+insertRowsDrained          = 0
+peakPendingInsertRows      = 0
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 0
+avgEntriesPerFlush         = 38.5155
+maxEntriesInSingleFlush    = 40
+walToPhysicalUpdateRatio   = 38.5155x
+pendingWALEntriesNow       = 0
+------------------------------------------
+InMemory: created table Stock
+InMemory: populated table Stock with 10000 rows and 0 payload bytes/row
+
+--- WAL Instrumentation: Eager_Figure3_Normal_chain_40 ---
+walEntriesCreated          = 5000000
+walEntriesFlushed          = 5000000
+physicalUpdatesApplied     = 5000000
+physicalInsertsApplied     = 0
+physicalDeletesApplied     = 0
+dependencyEntriesConsumed  = 0
+dependencyPhysicalUpdates  = 0
+flushCalls                 = 5000000
+readTriggeredFlushes       = 0
+readTriggeredWALEntries    = 0
+readRequests               = 0
+pointReadRequests          = 0
+wholeTableReadRequests     = 0
+unknownReadRequests        = 0
+readRequestsWithPending    = 0
+readPendingBucketsAtPlan   = 0
+readBucketsMaterialised    = 0
+readPhysicalExprsEmitted   = 0
+pointReadBucketsMaterialised = 0
+wholeReadBucketsMaterialised = 0
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 0
+readBucketsWithInsert      = 0
+readBucketsWithDelete      = 0
+readBucketsWithUpdates     = 0
+readBucketsWithSameRowDeps = 0
+readBucketsWithCrossRowDeps = 0
+readLifecycleOnlyBuckets   = 0
+readOneColumnBuckets       = 0
+readMultiColumnBuckets     = 0
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 0
+readEntryBuckets[2-4]      = 0
+readEntryBuckets[5-16]     = 0
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 0
+insertTriggeredFlushes     = 0
+globalThresholdFlushes     = 0
+manualFlushes              = 5000000
+otherFlushes               = 0
+insertDrainCalls           = 0
+insertRowsDrained          = 0
+peakPendingInsertRows      = 0
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 0
+avgEntriesPerFlush         = 1
+maxEntriesInSingleFlush    = 1
+walToPhysicalUpdateRatio   = 1x
+pendingWALEntriesNow       = 0
+------------------------------------------
+  40        44051        36340        1.2122x
+InMemory: created table Stock
+InMemory: populated table Stock with 10000 rows and 0 payload bytes/row
+
+--- WAL Instrumentation: Lazy_Figure3_Normal_chain_60 ---
+walEntriesCreated          = 5000000
+walEntriesFlushed          = 5000000
+physicalUpdatesApplied     = 88454
+physicalInsertsApplied     = 0
+physicalDeletesApplied     = 0
+dependencyEntriesConsumed  = 0
+dependencyPhysicalUpdates  = 0
+flushCalls                 = 88454
+readTriggeredFlushes       = 0
+readTriggeredWALEntries    = 0
+readRequests               = 0
+pointReadRequests          = 0
+wholeTableReadRequests     = 0
+unknownReadRequests        = 0
+readRequestsWithPending    = 0
+readPendingBucketsAtPlan   = 0
+readBucketsMaterialised    = 0
+readPhysicalExprsEmitted   = 0
+pointReadBucketsMaterialised = 0
+wholeReadBucketsMaterialised = 0
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 0
+readBucketsWithInsert      = 0
+readBucketsWithDelete      = 0
+readBucketsWithUpdates     = 0
+readBucketsWithSameRowDeps = 0
+readBucketsWithCrossRowDeps = 0
+readLifecycleOnlyBuckets   = 0
+readOneColumnBuckets       = 0
+readMultiColumnBuckets     = 0
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 0
+readEntryBuckets[2-4]      = 0
+readEntryBuckets[5-16]     = 0
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 0
+insertTriggeredFlushes     = 0
+globalThresholdFlushes     = 0
+manualFlushes              = 88454
+otherFlushes               = 0
+insertDrainCalls           = 0
+insertRowsDrained          = 0
+peakPendingInsertRows      = 0
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 0
+avgEntriesPerFlush         = 56.5266
+maxEntriesInSingleFlush    = 60
+walToPhysicalUpdateRatio   = 56.5266x
+pendingWALEntriesNow       = 0
+------------------------------------------
+InMemory: created table Stock
+InMemory: populated table Stock with 10000 rows and 0 payload bytes/row
+
+--- WAL Instrumentation: Eager_Figure3_Normal_chain_60 ---
+walEntriesCreated          = 5000000
+walEntriesFlushed          = 5000000
+physicalUpdatesApplied     = 5000000
+physicalInsertsApplied     = 0
+physicalDeletesApplied     = 0
+dependencyEntriesConsumed  = 0
+dependencyPhysicalUpdates  = 0
+flushCalls                 = 5000000
+readTriggeredFlushes       = 0
+readTriggeredWALEntries    = 0
+readRequests               = 0
+pointReadRequests          = 0
+wholeTableReadRequests     = 0
+unknownReadRequests        = 0
+readRequestsWithPending    = 0
+readPendingBucketsAtPlan   = 0
+readBucketsMaterialised    = 0
+readPhysicalExprsEmitted   = 0
+pointReadBucketsMaterialised = 0
+wholeReadBucketsMaterialised = 0
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 0
+readBucketsWithInsert      = 0
+readBucketsWithDelete      = 0
+readBucketsWithUpdates     = 0
+readBucketsWithSameRowDeps = 0
+readBucketsWithCrossRowDeps = 0
+readLifecycleOnlyBuckets   = 0
+readOneColumnBuckets       = 0
+readMultiColumnBuckets     = 0
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 0
+readEntryBuckets[2-4]      = 0
+readEntryBuckets[5-16]     = 0
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 0
+insertTriggeredFlushes     = 0
+globalThresholdFlushes     = 0
+manualFlushes              = 5000000
+otherFlushes               = 0
+insertDrainCalls           = 0
+insertRowsDrained          = 0
+peakPendingInsertRows      = 0
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 0
+avgEntriesPerFlush         = 1
+maxEntriesInSingleFlush    = 1
+walToPhysicalUpdateRatio   = 1x
+pendingWALEntriesNow       = 0
+------------------------------------------
+  60        43198        36501        1.18346x
+InMemory: created table Stock
+InMemory: populated table Stock with 10000 rows and 0 payload bytes/row
+
+--- WAL Instrumentation: Lazy_Figure3_Normal_chain_80 ---
+walEntriesCreated          = 5000000
+walEntriesFlushed          = 5000000
+physicalUpdatesApplied     = 68139
+physicalInsertsApplied     = 0
+physicalDeletesApplied     = 0
+dependencyEntriesConsumed  = 0
+dependencyPhysicalUpdates  = 0
+flushCalls                 = 68139
+readTriggeredFlushes       = 0
+readTriggeredWALEntries    = 0
+readRequests               = 0
+pointReadRequests          = 0
+wholeTableReadRequests     = 0
+unknownReadRequests        = 0
+readRequestsWithPending    = 0
+readPendingBucketsAtPlan   = 0
+readBucketsMaterialised    = 0
+readPhysicalExprsEmitted   = 0
+pointReadBucketsMaterialised = 0
+wholeReadBucketsMaterialised = 0
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 0
+readBucketsWithInsert      = 0
+readBucketsWithDelete      = 0
+readBucketsWithUpdates     = 0
+readBucketsWithSameRowDeps = 0
+readBucketsWithCrossRowDeps = 0
+readLifecycleOnlyBuckets   = 0
+readOneColumnBuckets       = 0
+readMultiColumnBuckets     = 0
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 0
+readEntryBuckets[2-4]      = 0
+readEntryBuckets[5-16]     = 0
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 0
+insertTriggeredFlushes     = 0
+globalThresholdFlushes     = 0
+manualFlushes              = 68139
+otherFlushes               = 0
+insertDrainCalls           = 0
+insertRowsDrained          = 0
+peakPendingInsertRows      = 0
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 0
+avgEntriesPerFlush         = 73.3794
+maxEntriesInSingleFlush    = 80
+walToPhysicalUpdateRatio   = 73.3794x
+pendingWALEntriesNow       = 0
+------------------------------------------
+InMemory: created table Stock
+InMemory: populated table Stock with 10000 rows and 0 payload bytes/row
+
+--- WAL Instrumentation: Eager_Figure3_Normal_chain_80 ---
+walEntriesCreated          = 5000000
+walEntriesFlushed          = 5000000
+physicalUpdatesApplied     = 5000000
+physicalInsertsApplied     = 0
+physicalDeletesApplied     = 0
+dependencyEntriesConsumed  = 0
+dependencyPhysicalUpdates  = 0
+flushCalls                 = 5000000
+readTriggeredFlushes       = 0
+readTriggeredWALEntries    = 0
+readRequests               = 0
+pointReadRequests          = 0
+wholeTableReadRequests     = 0
+unknownReadRequests        = 0
+readRequestsWithPending    = 0
+readPendingBucketsAtPlan   = 0
+readBucketsMaterialised    = 0
+readPhysicalExprsEmitted   = 0
+pointReadBucketsMaterialised = 0
+wholeReadBucketsMaterialised = 0
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 0
+readBucketsWithInsert      = 0
+readBucketsWithDelete      = 0
+readBucketsWithUpdates     = 0
+readBucketsWithSameRowDeps = 0
+readBucketsWithCrossRowDeps = 0
+readLifecycleOnlyBuckets   = 0
+readOneColumnBuckets       = 0
+readMultiColumnBuckets     = 0
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 0
+readEntryBuckets[2-4]      = 0
+readEntryBuckets[5-16]     = 0
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 0
+insertTriggeredFlushes     = 0
+globalThresholdFlushes     = 0
+manualFlushes              = 5000000
+otherFlushes               = 0
+insertDrainCalls           = 0
+insertRowsDrained          = 0
+peakPendingInsertRows      = 0
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 0
+avgEntriesPerFlush         = 1
+maxEntriesInSingleFlush    = 1
+walToPhysicalUpdateRatio   = 1x
+pendingWALEntriesNow       = 0
+------------------------------------------
+  80        42763        36441        1.1735x
+InMemory: created table Stock
+InMemory: populated table Stock with 10000 rows and 0 payload bytes/row
+
+--- WAL Instrumentation: Lazy_Figure3_Normal_chain_100 ---
+walEntriesCreated          = 5000000
+walEntriesFlushed          = 5000000
+physicalUpdatesApplied     = 54942
+physicalInsertsApplied     = 0
+physicalDeletesApplied     = 0
+dependencyEntriesConsumed  = 0
+dependencyPhysicalUpdates  = 0
+flushCalls                 = 54942
+readTriggeredFlushes       = 0
+readTriggeredWALEntries    = 0
+readRequests               = 0
+pointReadRequests          = 0
+wholeTableReadRequests     = 0
+unknownReadRequests        = 0
+readRequestsWithPending    = 0
+readPendingBucketsAtPlan   = 0
+readBucketsMaterialised    = 0
+readPhysicalExprsEmitted   = 0
+pointReadBucketsMaterialised = 0
+wholeReadBucketsMaterialised = 0
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 0
+readBucketsWithInsert      = 0
+readBucketsWithDelete      = 0
+readBucketsWithUpdates     = 0
+readBucketsWithSameRowDeps = 0
+readBucketsWithCrossRowDeps = 0
+readLifecycleOnlyBuckets   = 0
+readOneColumnBuckets       = 0
+readMultiColumnBuckets     = 0
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 0
+readEntryBuckets[2-4]      = 0
+readEntryBuckets[5-16]     = 0
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 0
+insertTriggeredFlushes     = 0
+globalThresholdFlushes     = 0
+manualFlushes              = 54942
+otherFlushes               = 0
+insertDrainCalls           = 0
+insertRowsDrained          = 0
+peakPendingInsertRows      = 0
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 0
+avgEntriesPerFlush         = 91.0051
+maxEntriesInSingleFlush    = 100
+walToPhysicalUpdateRatio   = 91.0051x
+pendingWALEntriesNow       = 0
+------------------------------------------
+InMemory: created table Stock
+InMemory: populated table Stock with 10000 rows and 0 payload bytes/row
+
+--- WAL Instrumentation: Eager_Figure3_Normal_chain_100 ---
+walEntriesCreated          = 5000000
+walEntriesFlushed          = 5000000
+physicalUpdatesApplied     = 5000000
+physicalInsertsApplied     = 0
+physicalDeletesApplied     = 0
+dependencyEntriesConsumed  = 0
+dependencyPhysicalUpdates  = 0
+flushCalls                 = 5000000
+readTriggeredFlushes       = 0
+readTriggeredWALEntries    = 0
+readRequests               = 0
+pointReadRequests          = 0
+wholeTableReadRequests     = 0
+unknownReadRequests        = 0
+readRequestsWithPending    = 0
+readPendingBucketsAtPlan   = 0
+readBucketsMaterialised    = 0
+readPhysicalExprsEmitted   = 0
+pointReadBucketsMaterialised = 0
+wholeReadBucketsMaterialised = 0
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 0
+readBucketsWithInsert      = 0
+readBucketsWithDelete      = 0
+readBucketsWithUpdates     = 0
+readBucketsWithSameRowDeps = 0
+readBucketsWithCrossRowDeps = 0
+readLifecycleOnlyBuckets   = 0
+readOneColumnBuckets       = 0
+readMultiColumnBuckets     = 0
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 0
+readEntryBuckets[2-4]      = 0
+readEntryBuckets[5-16]     = 0
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 0
+insertTriggeredFlushes     = 0
+globalThresholdFlushes     = 0
+manualFlushes              = 5000000
+otherFlushes               = 0
+insertDrainCalls           = 0
+insertRowsDrained          = 0
+peakPendingInsertRows      = 0
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 0
+avgEntriesPerFlush         = 1
+maxEntriesInSingleFlush    = 1
+walToPhysicalUpdateRatio   = 1x
+pendingWALEntriesNow       = 0
+------------------------------------------
+  100        42633        36549        1.16647x
+===============================================================================
+All tests passed (2 assertions in 1 test case)
+

@@ -1,0 +1,48 @@
+# started on Mon Aug 31 18:33:39 2026
+
+
+ Performance counter stats for './build/BOSS-prefix/src/BOSS-build/Tests Profile Dependency - Same Row Sparse Chain 100 --library build/libBOSSTransactionLogEngine.so --library BOSSInMemoryWriteEngine/build/libBOSSInMemoryWriteEngine.so':
+
+    11,626,852,447      task-clock                       #    0.997 CPUs utilized             
+               112      context-switches                 #    9.633 /sec                      
+                 5      cpu-migrations                   #    0.430 /sec                      
+           202,055      page-faults                      #   17.378 K/sec                     
+    56,335,525,227      cpu_atom/instructions/           #    1.26  insn per cycle              (0.01%)
+   155,323,681,031      cpu_core/instructions/           #    2.59  insn per cycle              (35.69%)
+    44,582,209,488      cpu_atom/cycles/                 #    3.834 GHz                         (0.01%)
+    59,930,884,717      cpu_core/cycles/                 #    5.155 GHz                         (42.84%)
+    11,436,775,927      cpu_atom/branches/               #  983.652 M/sec                       (0.01%)
+    33,674,607,050      cpu_core/branches/               #    2.896 G/sec                       (49.98%)
+       256,836,907      cpu_atom/branch-misses/          #    2.25% of all branches             (0.02%)
+        25,024,162      cpu_core/branch-misses/          #    0.07% of all branches             (57.13%)
+ #      7.6 %  tma_backend_bound      
+                                                  #      3.2 %  tma_bad_speculation    
+                                                  #     43.6 %  tma_frontend_bound     
+                                                  #     45.6 %  tma_retiring             (64.27%)
+ #     19.2 %  tma_bad_speculation    
+                                                  #     30.7 %  tma_retiring             (0.02%)
+ #     23.5 %  tma_backend_bound      
+                                                  #     26.5 %  tma_frontend_bound       (0.02%)
+     8,247,730,120      cpu_atom/L1-dcache-loads/        #  709.369 M/sec                       (0.00%)
+    41,004,241,416      cpu_core/L1-dcache-loads/        #    3.527 G/sec                       (71.43%)
+       240,108,630      cpu_core/L1-dcache-load-misses/  #    0.59% of all L1-dcache accesses   (71.43%)
+     <not counted>      cpu_atom/LLC-loads/                                                     (0.00%)
+        74,374,434      cpu_core/LLC-loads/              #    6.397 M/sec                       (71.44%)
+     <not counted>      cpu_atom/LLC-load-misses/                                               (0.00%)
+        40,903,474      cpu_core/LLC-load-misses/        #   55.00% of all LL-cache accesses    (71.44%)
+     <not counted>      cpu_atom/L1-icache-loads/                                               (0.00%)
+     <not counted>      cpu_atom/L1-icache-load-misses/                                         (0.00%)
+     3,291,767,581      cpu_core/L1-icache-load-misses/                                         (28.56%)
+     <not counted>      cpu_atom/dTLB-loads/                                                    (0.00%)
+    41,042,964,104      cpu_core/dTLB-loads/             #    3.530 G/sec                       (28.55%)
+     <not counted>      cpu_atom/dTLB-load-misses/                                              (0.00%)
+        32,193,493      cpu_core/dTLB-load-misses/       #    0.08% of all dTLB cache accesses  (28.55%)
+     <not counted>      cpu_atom/iTLB-load-misses/                                              (0.00%)
+         2,407,398      cpu_core/iTLB-load-misses/                                              (28.55%)
+
+      11.656929380 seconds time elapsed
+
+      11.476882000 seconds user
+       0.174922000 seconds sys
+
+

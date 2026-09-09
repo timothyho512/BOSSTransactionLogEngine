@@ -1,0 +1,39 @@
+# started on Mon Aug 31 15:25:42 2026
+
+
+ Performance counter stats for 'taskset -c 8 ./build/BOSS-prefix/src/BOSS-build/Tests Benchmark Figure 4 - External Read Latency CDF (Uniform) --library build/libBOSSTransactionLogEngine.so --library BOSSInMemoryWriteEngine/build/libBOSSInMemoryWriteEngine.so':
+
+    47,150,408,109      task-clock                       #    0.999 CPUs utilized             
+               385      context-switches                 #    8.165 /sec                      
+                 1      cpu-migrations                   #    0.021 /sec                      
+           107,804      page-faults                      #    2.286 K/sec                     
+   189,105,341,105      cpu_atom/instructions/           #    1.06  insn per cycle              (0.00%)
+   672,239,909,041      cpu_core/instructions/           #    2.75  insn per cycle              (100.00%)
+   179,120,366,132      cpu_atom/cycles/                 #    3.799 GHz                         (0.00%)
+   244,171,426,352      cpu_core/cycles/                 #    5.179 GHz                         (100.00%)
+    35,581,277,938      cpu_atom/branches/               #  754.634 M/sec                       (0.00%)
+   145,484,354,195      cpu_core/branches/               #    3.086 G/sec                       (100.00%)
+     1,087,085,546      cpu_atom/branch-misses/          #    3.06% of all branches             (0.00%)
+       109,520,002      cpu_core/branch-misses/          #    0.08% of all branches             (100.00%)
+ #      3.1 %  tma_backend_bound      
+                                                  #      2.7 %  tma_bad_speculation    
+                                                  #     47.8 %  tma_frontend_bound     
+                                                  #     46.3 %  tma_retiring             (100.00%)
+ #     35.7 %  tma_bad_speculation    
+                                                  #     26.5 %  tma_retiring             (0.00%)
+ #      0.0 %  tma_backend_bound      
+                                                  #     37.9 %  tma_frontend_bound       (0.00%)
+     <not counted>      cpu_atom/L1-dcache-loads/                                               (0.00%)
+   178,006,150,529      cpu_core/L1-dcache-loads/        #    3.775 G/sec                       (100.00%)
+       828,300,335      cpu_core/L1-dcache-load-misses/  #    0.47% of all L1-dcache accesses   (100.00%)
+     <not counted>      cpu_atom/LLC-loads/                                                     (0.00%)
+       248,026,140      cpu_core/LLC-loads/              #    5.260 M/sec                       (100.00%)
+     <not counted>      cpu_atom/LLC-load-misses/                                               (0.00%)
+        93,606,226      cpu_core/LLC-load-misses/        #   37.74% of all LL-cache accesses    (100.00%)
+
+      47.183021928 seconds time elapsed
+
+      47.056560000 seconds user
+       0.106973000 seconds sys
+
+

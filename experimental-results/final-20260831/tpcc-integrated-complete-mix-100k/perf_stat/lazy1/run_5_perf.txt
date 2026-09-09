@@ -1,0 +1,48 @@
+# started on Mon Aug 31 20:15:34 2026
+
+
+ Performance counter stats for './build/BOSS-prefix/src/BOSS-build/Tests Profile TPC-C Integrated Higher Fidelity Complete Mix - NewOrder 45 Payment 43 OrderStatus 4 StockLevel 4 Delivery 4 Lazy Chain 1 Bounded Inserts 1 Transactions 100k --library build/libBOSSTransactionLogEngine.so --library BOSSInMemoryWriteEngine/build/libBOSSInMemoryWriteEngine.so':
+
+    16,169,184,202      task-clock                       #    0.998 CPUs utilized             
+               164      context-switches                 #   10.143 /sec                      
+                 4      cpu-migrations                   #    0.247 /sec                      
+           261,352      page-faults                      #   16.164 K/sec                     
+    52,826,391,253      cpu_atom/instructions/           #    0.85  insn per cycle              (0.00%)
+   216,281,682,997      cpu_core/instructions/           #    2.60  insn per cycle              (35.70%)
+    62,175,961,398      cpu_atom/cycles/                 #    3.845 GHz                         (0.01%)
+    83,057,772,682      cpu_core/cycles/                 #    5.137 GHz                         (42.84%)
+    16,079,604,591      cpu_atom/branches/               #  994.460 M/sec                       (0.01%)
+    47,157,380,576      cpu_core/branches/               #    2.916 G/sec                       (49.98%)
+       139,894,614      cpu_atom/branch-misses/          #    0.87% of all branches             (0.02%)
+       159,807,737      cpu_core/branch-misses/          #    0.34% of all branches             (57.12%)
+ #     10.5 %  tma_backend_bound      
+                                                  #      5.7 %  tma_bad_speculation    
+                                                  #     37.9 %  tma_frontend_bound     
+                                                  #     45.9 %  tma_retiring             (64.26%)
+ #      0.9 %  tma_bad_speculation    
+                                                  #     40.2 %  tma_retiring             (0.03%)
+ #     43.8 %  tma_backend_bound      
+                                                  #     15.0 %  tma_frontend_bound       (0.03%)
+    20,180,986,459      cpu_atom/L1-dcache-loads/        #    1.248 G/sec                       (0.02%)
+    57,960,330,833      cpu_core/L1-dcache-loads/        #    3.585 G/sec                       (71.40%)
+       449,628,949      cpu_core/L1-dcache-load-misses/  #    0.78% of all L1-dcache accesses   (71.40%)
+         6,569,025      cpu_atom/LLC-loads/              #  406.268 K/sec                       (0.01%)
+        40,413,067      cpu_core/LLC-loads/              #    2.499 M/sec                       (71.41%)
+                 0      cpu_atom/LLC-load-misses/                                               (0.01%)
+        13,293,327      cpu_core/LLC-load-misses/        #   32.89% of all LL-cache accesses    (71.41%)
+     8,732,924,409      cpu_atom/L1-icache-loads/        #  540.097 M/sec                       (0.00%)
+     <not counted>      cpu_atom/L1-icache-load-misses/                                         (0.00%)
+     4,417,699,840      cpu_core/L1-icache-load-misses/                                         (28.57%)
+     <not counted>      cpu_atom/dTLB-loads/                                                    (0.00%)
+    58,047,071,885      cpu_core/dTLB-loads/             #    3.590 G/sec                       (28.56%)
+     <not counted>      cpu_atom/dTLB-load-misses/                                              (0.00%)
+        18,242,129      cpu_core/dTLB-load-misses/       #    0.03% of all dTLB cache accesses  (28.56%)
+     <not counted>      cpu_atom/iTLB-load-misses/                                              (0.00%)
+         1,324,102      cpu_core/iTLB-load-misses/                                              (28.55%)
+
+      16.197597991 seconds time elapsed
+
+      15.938552000 seconds user
+       0.252929000 seconds sys
+
+

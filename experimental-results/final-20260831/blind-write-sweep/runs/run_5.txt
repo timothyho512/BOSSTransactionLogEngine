@@ -1,0 +1,40 @@
+Filters: "Benchmark Figure 6 - Blind Write Throughput"
+Randomness seeded to: 886636204
+
+=== Figure 6-style Blind Write Throughput ===
+Parameters:
+  NUM_CARTS       = 1000
+  ITEMS_PER_CART  = 20
+  TOTAL_SESSIONS  = 10000
+  TOTAL_OPS/run   = 210000
+
+BlindFrac  Lazy(txns/s)  Eager(txns/s)  Speedup  Blind/NonBlind
+---------  ------------  -------------  -------  --------------
+InMemory: created table Cart
+InMemory: populated table Cart with 1000 rows and 0 payload bytes/row
+InMemory: created table Cart
+InMemory: populated table Cart with 1000 rows and 0 payload bytes/row
+  1/32       502319          303923          1.65278x    322/9678
+InMemory: created table Cart
+InMemory: populated table Cart with 1000 rows and 0 payload bytes/row
+InMemory: created table Cart
+InMemory: populated table Cart with 1000 rows and 0 payload bytes/row
+  1/16       512452          303454          1.68873x    625/9375
+InMemory: created table Cart
+InMemory: populated table Cart with 1000 rows and 0 payload bytes/row
+InMemory: created table Cart
+InMemory: populated table Cart with 1000 rows and 0 payload bytes/row
+  1/8       516452          303174          1.70348x    1222/8778
+InMemory: created table Cart
+InMemory: populated table Cart with 1000 rows and 0 payload bytes/row
+InMemory: created table Cart
+InMemory: populated table Cart with 1000 rows and 0 payload bytes/row
+  1/4       524970          301598          1.74063x    2499/7501
+InMemory: created table Cart
+InMemory: populated table Cart with 1000 rows and 0 payload bytes/row
+InMemory: created table Cart
+InMemory: populated table Cart with 1000 rows and 0 payload bytes/row
+  1/2       539698          301218          1.79172x    5052/4948
+===============================================================================
+All tests passed (2 assertions in 1 test case)
+

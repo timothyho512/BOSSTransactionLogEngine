@@ -1,0 +1,8 @@
+Workload: Normal
+Rows: 100000
+Logical transactions: 1000000
+Records per transaction: 10
+Lazy chain bound: 100
+Payload bytes per row: 0, 4096, 16384
+Policies: Eager, Lazy-100
+Runs per configuration: 5

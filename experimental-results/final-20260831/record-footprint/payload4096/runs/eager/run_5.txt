@@ -1,0 +1,103 @@
+Filters: "Profile Figure 3 Paper Footprint - Normal Eager Chain 100 Rows 100k Payload 4096"
+Randomness seeded to: 1464229265
+InMemory: created table Stock
+InMemory: populated table Stock with 100000 rows and 4096 payload bytes/row
+
+--- WAL Instrumentation: Profile_Eager_Figure3_Normal_chain_100_rows_100k_payload_4096 ---
+walEntriesCreated          = 10000000
+walEntriesFlushed          = 10000000
+physicalUpdatesApplied     = 10000000
+physicalInsertsApplied     = 0
+physicalDeletesApplied     = 0
+dependencyEntriesConsumed  = 0
+dependencyPhysicalUpdates  = 0
+flushCalls                 = 10000000
+readTriggeredFlushes       = 0
+readTriggeredWALEntries    = 0
+readRequests               = 0
+pointReadRequests          = 0
+wholeTableReadRequests     = 0
+unknownReadRequests        = 0
+readRequestsWithPending    = 0
+readPendingBucketsAtPlan   = 0
+readBucketsMaterialised    = 0
+readPhysicalExprsEmitted   = 0
+pointReadBucketsMaterialised = 0
+wholeReadBucketsMaterialised = 0
+unknownReadBucketsMaterialised = 0
+readColumnSelectiveBuckets = 0
+readBucketsWithInsert      = 0
+readBucketsWithDelete      = 0
+readBucketsWithUpdates     = 0
+readBucketsWithSameRowDeps = 0
+readBucketsWithCrossRowDeps = 0
+readLifecycleOnlyBuckets   = 0
+readOneColumnBuckets       = 0
+readMultiColumnBuckets     = 0
+readEntryBuckets[0]        = 0
+readEntryBuckets[1]        = 0
+readEntryBuckets[2-4]      = 0
+readEntryBuckets[5-16]     = 0
+readEntryBuckets[17+]      = 0
+chainTriggeredFlushes      = 0
+insertTriggeredFlushes     = 0
+globalThresholdFlushes     = 0
+manualFlushes              = 10000000
+otherFlushes               = 0
+insertDrainCalls           = 0
+insertRowsDrained          = 0
+peakPendingInsertRows      = 0
+pendingInsertRowsNow       = 0
+insertDrainThreshold       = 0
+avgEntriesPerFlush         = 1
+maxEntriesInSingleFlush    = 1
+walToPhysicalUpdateRatio   = 1x
+pendingWALEntriesNow       = 0
+------------------------------------------
+
+=== InMemory Stats: Profile_Eager_Figure3_Normal_chain_100_rows_100k_payload_4096 ===
+physicalUpdateRows      = 10000000
+indexRowsInserted       = 0
+indexRowsRemoved        = 0
+indexRowsRekeyed        = 0
+selectRowsRead          = 0
+boundSelectScans        = 0
+genericSelectScans      = 0
+selectPointReadRequests = 0
+selectPointReadHits     = 0
+selectPointReadMisses   = 0
+indexLookupRequests     = 0
+indexPrefixLookups      = 0
+indexExactLookups       = 0
+indexLookupHits         = 0
+indexLookupMisses       = 0
+indexCandidatesExamined = 0
+selectScansAvoided      = 0
+selectScanRequests      = 0
+selectCandidatesExamined = 0
+selectRowsMatched       = 0
+selectResultRowsBuilt   = 0
+selectResultCellsBuilt  = 0
+topOneRequests          = 0
+topOneIndexLookups      = 0
+topOneScanFallbacks     = 0
+topOneCandidatesExamined = 0
+projectedResultRowsBuilt = 0
+projectedResultCellsBuilt = 0
+payloadTouches          = 10000000
+payloadBytesTouched     = 40960000000
+payloadChecksum         = 34291
+totalPayloadBytes       = 409600000
+
+=== Focused paper-footprint profile case ===
+Label               = Profile_Eager_Figure3_Normal_chain_100_rows_100k_payload_4096
+Mode                = Eager
+Workload            = Normal
+Chain length        = 100
+NUM_ROWS            = 100000
+Payload bytes/row   = 4096
+TOTAL_TRANSACTIONS  = 1000000
+Throughput          = 29408 txns/s
+===============================================================================
+All tests passed (2 assertions in 1 test case)
+

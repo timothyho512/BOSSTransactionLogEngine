@@ -1,0 +1,9 @@
+Filters: "Benchmark Figure 6 - Blind write sanity check"
+Randomness seeded to: 305832428
+InMemory: created table Cart
+InMemory: populated table Cart with 1000 rows and 0 payload bytes/row
+
+Blind-write sanity check: cart 5 value = 0
+===============================================================================
+All tests passed (2 assertions in 1 test case)
+

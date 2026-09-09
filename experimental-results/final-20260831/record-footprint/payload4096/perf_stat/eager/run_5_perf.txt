@@ -1,0 +1,48 @@
+# started on Mon Aug 31 18:56:52 2026
+
+
+ Performance counter stats for './build/BOSS-prefix/src/BOSS-build/Tests Profile Figure 3 Paper Footprint - Normal Eager Chain 100 Rows 100k Payload 4096 --library build/libBOSSTransactionLogEngine.so --library BOSSInMemoryWriteEngine/build/libBOSSInMemoryWriteEngine.so':
+
+    34,219,177,254      task-clock                       #    1.000 CPUs utilized             
+               287      context-switches                 #    8.387 /sec                      
+                 4      cpu-migrations                   #    0.117 /sec                      
+           103,973      page-faults                      #    3.038 K/sec                     
+   122,982,196,755      cpu_atom/instructions/           #    0.94  insn per cycle              (0.00%)
+   464,950,535,569      cpu_core/instructions/           #    2.64  insn per cycle              (35.70%)
+   130,535,921,056      cpu_atom/cycles/                 #    3.815 GHz                         (0.01%)
+   176,363,843,911      cpu_core/cycles/                 #    5.154 GHz                         (42.85%)
+    33,551,321,052      cpu_atom/branches/               #  980.483 M/sec                       (0.01%)
+    94,066,795,914      cpu_core/branches/               #    2.749 G/sec                       (49.99%)
+       557,774,389      cpu_atom/branch-misses/          #    1.66% of all branches             (0.01%)
+       229,151,494      cpu_core/branch-misses/          #    0.24% of all branches             (57.13%)
+ #     24.3 %  tma_backend_bound      
+                                                  #      2.7 %  tma_bad_speculation    
+                                                  #     17.7 %  tma_frontend_bound     
+                                                  #     55.3 %  tma_retiring             (64.28%)
+ #     25.8 %  tma_bad_speculation    
+                                                  #     32.4 %  tma_retiring             (0.01%)
+ #     17.9 %  tma_backend_bound      
+                                                  #     23.9 %  tma_frontend_bound       (0.01%)
+     <not counted>      cpu_atom/L1-dcache-loads/                                               (0.00%)
+   123,757,670,224      cpu_core/L1-dcache-loads/        #    3.617 G/sec                       (71.42%)
+       584,856,742      cpu_core/L1-dcache-load-misses/  #    0.47% of all L1-dcache accesses   (71.43%)
+     <not counted>      cpu_atom/LLC-loads/                                                     (0.00%)
+        98,792,638      cpu_core/LLC-loads/              #    2.887 M/sec                       (71.43%)
+     <not counted>      cpu_atom/LLC-load-misses/                                               (0.00%)
+        80,686,754      cpu_core/LLC-load-misses/        #   81.67% of all LL-cache accesses    (71.43%)
+     <not counted>      cpu_atom/L1-icache-loads/                                               (0.00%)
+     <not counted>      cpu_atom/L1-icache-load-misses/                                         (0.00%)
+     9,343,181,876      cpu_core/L1-icache-load-misses/                                         (28.57%)
+     <not counted>      cpu_atom/dTLB-loads/                                                    (0.00%)
+   123,847,844,221      cpu_core/dTLB-loads/             #    3.619 G/sec                       (28.57%)
+     <not counted>      cpu_atom/dTLB-load-misses/                                              (0.00%)
+        14,466,406      cpu_core/dTLB-load-misses/       #    0.01% of all dTLB cache accesses  (28.56%)
+     <not counted>      cpu_atom/iTLB-load-misses/                                              (0.00%)
+           849,026      cpu_core/iTLB-load-misses/                                              (28.56%)
+
+      34.234127414 seconds time elapsed
+
+      34.106387000 seconds user
+       0.112971000 seconds sys
+
+

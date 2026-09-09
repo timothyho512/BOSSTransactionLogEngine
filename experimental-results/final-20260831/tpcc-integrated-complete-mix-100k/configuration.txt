@@ -1,0 +1,10 @@
+Profile: Integrated higher-fidelity complete TPC-C-inspired mix
+Transactions: 100000
+Warehouses: 1
+Mix: NewOrder 45%, Payment 43%, OrderStatus 4%, StockLevel 4%, Delivery 4%
+Eager: transaction-boundary materialisation
+Lazy-1: chain bound 1, insert threshold 1
+Lazy-100: chain bound 100, insert threshold 700
+Customer/request seed: 20260820
+Realistic NewOrder seed: 20260821
+Runs per policy: 5
