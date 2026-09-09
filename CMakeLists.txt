@@ -61,3 +61,25 @@ add_dependencies(BOSSTransactionLogEngine BOSS)
 
 set_target_properties(BOSSTransactionLogEngine PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
 install(TARGETS BOSSTransactionLogEngine LIBRARY DESTINATION lib)
+
+# Interactive BOSS-expression client. It is optional so the existing engine-only
+# configure/build path remains unchanged when a demonstration is not required.
+option(BUILD_BOSS_DEMO "Build the interactive BOSS transaction demonstration" OFF)
+if(BUILD_BOSS_DEMO)
+  set(BOSS_DEMO_CORE_DIR "${BOSSTransactionLogEngine_BINARY_DIR}/deps" CACHE PATH
+    "Installed BOSS core used to compile the interactive demonstration")
+  set(BOSS_DEMO_CORE_LIBRARY
+    "${BOSS_DEMO_CORE_DIR}/lib/${CMAKE_SHARED_LIBRARY_PREFIX}BOSS${CMAKE_SHARED_LIBRARY_SUFFIX}")
+
+  add_executable(BOSSDemo Source/BOSSDemo.cpp)
+  set_property(TARGET BOSSDemo PROPERTY CXX_STANDARD 23)
+  target_include_directories(BOSSDemo SYSTEM PRIVATE ${BOSS_DEMO_CORE_DIR}/include)
+  target_link_libraries(BOSSDemo PRIVATE ${BOSS_DEMO_CORE_LIBRARY} ${CMAKE_DL_LIBS})
+  if(BOSS_DEMO_CORE_DIR STREQUAL "${BOSSTransactionLogEngine_BINARY_DIR}/deps")
+    add_dependencies(BOSSDemo BOSS)
+  endif()
+  set_target_properties(BOSSDemo PROPERTIES
+    BUILD_RPATH ${BOSS_DEMO_CORE_DIR}/lib
+    INSTALL_RPATH ${CMAKE_INSTALL_PREFIX}/lib)
+  install(TARGETS BOSSDemo RUNTIME DESTINATION bin)
+endif()

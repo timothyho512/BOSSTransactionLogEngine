@@ -1,2 +1,23 @@
 .DS_Store
-build/
+/build/
+/cmake-build-*/
+/out/
+compile_commands.json
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+
+# Test, benchmark, profiling, and coverage output
+/results/
+/test-results/
+/benchmark-results/
+/experiments/
+/output/
+*.profraw
+*.profdata
+perf.data
+perf.data.*
+*.gcda
+*.gcno
